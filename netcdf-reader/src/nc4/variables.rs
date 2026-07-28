@@ -225,6 +225,12 @@ pub(crate) fn resolve_dimension_scale_addresses(
     ds: &hdf5_reader::Dataset,
     group: &Group,
 ) -> Result<Vec<u64>> {
+    // A rank-0 variable has no dimensions to reference.
+    let ndim = ds.ndim();
+    if ndim == 0 {
+        return Ok(Vec::new());
+    }
+
     let attr = ds.attribute("DIMENSION_LIST").map_err(|_| {
         Error::InvalidData(format!(
             "dataset '{}' is missing required DIMENSION_LIST metadata",
@@ -232,12 +238,8 @@ pub(crate) fn resolve_dimension_scale_addresses(
         ))
     })?;
     let raw_data = &attr.raw_data;
-    let ndim = ds.ndim();
     let offset_size = group.offset_size();
 
-    if ndim == 0 {
-        return Ok(Vec::new());
-    }
     if raw_data.is_empty() {
         return Err(Error::InvalidData(format!(
             "dataset '{}' has empty DIMENSION_LIST metadata",
