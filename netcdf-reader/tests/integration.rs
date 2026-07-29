@@ -489,6 +489,29 @@ fn nc4_dense_empty_global_attributes() {
 
 #[cfg(feature = "netcdf4")]
 #[test]
+fn nc4_scalar_variable_has_no_dimensions() {
+    let path = required_fixture("netcdf4", "nc4_scalar_variable.nc");
+    let file = netcdf_reader::NcFile::open(&path).unwrap();
+
+    // A scalar variable carries no DIMENSION_LIST; it must not fail the open.
+    let variables = file.variables().unwrap();
+    let names: Vec<&str> = variables.iter().map(|v| v.name()).collect();
+    for expected in ["valid_time", "latitude", "longitude", "number", "t"] {
+        assert!(names.contains(&expected), "missing variable {expected}");
+    }
+
+    let number = variables.iter().find(|v| v.name() == "number").unwrap();
+    assert!(number.dimensions().is_empty());
+    assert!(!number.is_coordinate_variable());
+
+    // Dimensioned variables in the same file still resolve normally.
+    let t = variables.iter().find(|v| v.name() == "t").unwrap();
+    let t_dims: Vec<&str> = t.dimensions().iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(t_dims, ["valid_time", "latitude", "longitude"]);
+}
+
+#[cfg(feature = "netcdf4")]
+#[test]
 fn parallel_created_nc4_fixture_reads_like_ordinary_nc4_file() {
     let path = required_fixture("parallel", "parallel_nc4_compat.nc");
     let file = netcdf_reader::NcFile::open(&path).unwrap();

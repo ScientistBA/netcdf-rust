@@ -826,6 +826,42 @@ def generate_netcdf4_fixtures(base_dir):
         ds.setncattr(f"att_{index}", "")
     ds.close()
 
+    # ---- 13. nc4_scalar_variable.nc ----
+    # Tests: rank-0 variables, which NetCDF-4 writes without a DIMENSION_LIST
+    # attribute because they have no dimensions to reference. Shaped after a
+    # Copernicus CDS ERA5 download, whose scalar `number` (ensemble member) and
+    # `expver` variables sit alongside the gridded fields.
+    path = os.path.join(nc4_dir, "nc4_scalar_variable.nc")
+    print(f"  Generating {path}")
+    ds = netCDF4.Dataset(path, "w", format="NETCDF4")
+    ds.createDimension("valid_time", 2)
+    ds.createDimension("latitude", 3)
+    ds.createDimension("longitude", 4)
+
+    valid_time = ds.createVariable("valid_time", "i8", ("valid_time",))
+    valid_time.units = "seconds since 1970-01-01"
+    valid_time.calendar = "proleptic_gregorian"
+    valid_time[:] = [0, 3600]
+
+    latitude = ds.createVariable("latitude", "f4", ("latitude",))
+    latitude.units = "degrees_north"
+    latitude[:] = [10.0, 11.0, 12.0]
+
+    longitude = ds.createVariable("longitude", "f4", ("longitude",))
+    longitude.units = "degrees_east"
+    longitude[:] = [0.0, 1.0, 2.0, 3.0]
+
+    # Scalar: no dimensions, therefore no DIMENSION_LIST on disk.
+    number = ds.createVariable("number", "i8", ())
+    number.long_name = "ensemble member numerical id"
+    number[...] = 0
+
+    t = ds.createVariable("t", "f4", ("valid_time", "latitude", "longitude"))
+    t.units = "K"
+    t.long_name = "temperature"
+    t[:] = 280.0
+    ds.close()
+
 
 SECTION_GENERATORS = {
     "hdf5": ("HDF5 fixtures", "h5py", generate_hdf5_fixtures),

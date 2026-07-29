@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Fixed
+
+- read NetCDF-4 files containing scalar (rank-0) variables: such variables carry
+  no `DIMENSION_LIST` attribute, which previously failed the entire open under
+  `NcMetadataMode::Strict` rather than resolving to an empty dimension list
+
 ## 0.9.0 - 2026-07-23
 
 ### Writers (first release of `hdf5-writer` and `netcdf-writer`)
