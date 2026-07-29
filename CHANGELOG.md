@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.9.1 - 2026-07-28
+
 ### Fixed
 
 - read NetCDF-4 files containing scalar (rank-0) variables: such variables carry
