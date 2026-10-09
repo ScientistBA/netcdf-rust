@@ -1,0 +1,64 @@
+[package]
+name = "rust-hdf5"
+description = "Pure Rust HDF5 library with full read/write and SWMR support"
+version = "0.7.2"
+edition = "2021"
+rust-version = "1.89"
+license = "MIT"
+authors = ["Sang Woo Kim"]
+repository = "https://github.com/physwkim/rust-hdf5"
+
+[lints.rust]
+# `loom` is a custom cfg set only via `RUSTFLAGS="--cfg loom"` to run the
+# concurrency models in tests/loom_concurrency.rs. Declare it so the
+# `unexpected_cfgs` lint does not fire on `#[cfg(loom)]` in normal builds.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
+[dependencies]
+# The deflate filter uses two pure-Rust engines, one per direction, because
+# neither is the better choice for both: zlib-rs inflates 1.1-1.8x faster than
+# miniz_oxide, while its deflate at levels 1-8 gives up as much as 2.5x of the
+# compression ratio on periodic data (zlib-ng's match strategy), where
+# miniz_oxide tracks zlib's own output size to within a percent.
+flate2 = { version = "1", optional = true }
+zlib-rs = { version = "0.6", default-features = false, features = [
+    "std",
+], optional = true }
+lz4_flex = { version = "0.11", optional = true }
+bzip2 = { version = "0.5", optional = true }
+rust-zstd = { version = "0.4.1", default-features = false, optional = true }
+snap = { version = "1", optional = true }
+rayon = { version = "1", optional = true }
+memmap2 = { version = "0.9", optional = true }
+# The shuffle-family transposes (shuffle, bitshuffle, blosc, szip) run on
+# fearless_simd lanes under the `simd` feature. The crate sets no target-cpu,
+# so the binary is SSE2 baseline; run-time dispatch is what reaches AVX2,
+# AVX-512 and NEON.
+fearless_simd = { version = "1.0", optional = true }
+fearless_simd_macros = { version = "0.1", optional = true }
+
+[features]
+default = ["deflate", "simd"]
+deflate = ["flate2", "dep:zlib-rs"]
+lz4 = ["lz4_flex"]
+bzip2 = ["dep:bzip2"]
+blosc = ["lz4_flex", "dep:snap"]
+zstd = ["rust-zstd"]
+all_filters = ["deflate", "lz4", "bzip2", "blosc", "zstd"]
+parallel = ["rayon", "deflate"]
+mmap = ["memmap2"]
+threadsafe = []
+simd = ["dep:fearless_simd", "dep:fearless_simd_macros"]
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# loom is only pulled in when building with `--cfg loom`, so it never enters
+# the normal build, the published crate, or `cargo install`. Run the models
+# with: RUSTFLAGS="--cfg loom" cargo test --test loom_concurrency
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+[[bench]]
+name = "io_bench"
+harness = false

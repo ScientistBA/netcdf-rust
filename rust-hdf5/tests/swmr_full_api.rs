@@ -85,11 +85,94 @@ fn metadata_datasets_and_attributes_round_trip() {
         r.group_attr_string("/entry", "NX_class").unwrap(),
         "NXentry"
     );
-    assert!(r.group_attr_names("/entry").iter().any(|n| n == "version"));
+    assert!(r
+        .group_attr_names("/entry")
+        .unwrap()
+        .iter()
+        .any(|n| n == "version"));
     assert_eq!(
         r.group_attr_string("/", "file_name").unwrap(),
         "metadata.h5"
     );
+
+    cleanup(&path);
+}
+
+/// The SWMR metadata writers declare the character set they are named for,
+/// and the ASCII twin refuses a string that declaration would misdescribe.
+#[test]
+fn string_dataset_writers_declare_their_character_set() {
+    use rust_hdf5::{DatatypeMessage, H5File};
+
+    let path = unique_tmp("string_cset");
+    {
+        let mut w = SwmrFileWriter::create_with_locking(&path, NO_LOCK).unwrap();
+        w.write_string_dataset("utf8", &["\u{e9}t\u{e9}"]).unwrap();
+        w.write_string_dataset_ascii("ascii", &["2026-05-18T10:00:00"])
+            .unwrap();
+        let err = w
+            .write_string_dataset_ascii("rejected", &["\u{c548}\u{b155}"])
+            .expect_err("a non-ASCII string was accepted under an ASCII datatype")
+            .to_string();
+        assert!(err.contains("is not ASCII"), "got: {err}");
+        w.close().unwrap();
+    }
+
+    let file = H5File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("ascii").unwrap().datatype().unwrap(),
+        DatatypeMessage::VarLenString {
+            padding: 0,
+            charset: 0,
+        }
+    );
+    assert_eq!(
+        file.dataset("utf8").unwrap().datatype().unwrap(),
+        DatatypeMessage::VarLenString {
+            padding: 0,
+            charset: 1,
+        }
+    );
+    assert_eq!(
+        file.dataset("ascii").unwrap().read_strings().unwrap(),
+        vec!["2026-05-18T10:00:00".to_string()]
+    );
+    file.close().unwrap();
+
+    cleanup(&path);
+}
+
+/// The SWMR typed reads reinterpret the element image like `read_raw` does,
+/// so they owe the same byte-order conversion: a big-endian dataset read as
+/// `u32` must give the stored values, not their byte-reversed images.
+#[test]
+fn big_endian_dataset_reads_as_values() {
+    use rust_hdf5::{ByteOrder, DatatypeMessage, H5File};
+
+    let path = unique_tmp("big_endian");
+    let values: [u32; 4] = [1, 0x0102_0304, 0xdead_beef, u32::MAX];
+    {
+        let file = H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<u32>()
+            .datatype(DatatypeMessage::FixedPoint {
+                size: 4,
+                byte_order: ByteOrder::BigEndian,
+                signed: false,
+                bit_offset: 0,
+                bit_precision: 32,
+            })
+            .shape([values.len()])
+            .create("be")
+            .unwrap();
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_be_bytes()).collect();
+        ds.write_raw_bytes(&bytes).unwrap();
+        file.close().unwrap();
+    }
+
+    let mut r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
+    assert_eq!(r.read_dataset::<u32>("be").unwrap(), values);
+    assert_eq!(r.read_slice::<u32>("be", &[1], &[2]).unwrap(), values[1..3]);
 
     cleanup(&path);
 }
@@ -200,6 +283,110 @@ fn open_append_resumes_streaming() {
     cleanup(&path);
 }
 
+/// A multi-frame-chunk writer dropped without `close` still writes the band
+/// it was buffering: every appended frame is already in the extent, so the
+/// frames of the partial band would otherwise read back as fill.
+#[test]
+fn a_dropped_writer_writes_its_partial_band() {
+    let path = unique_tmp("drop_band");
+    {
+        let mut w = SwmrFileWriter::create_with_locking(&path, NO_LOCK).unwrap();
+        let ds = w
+            .create_streaming_dataset_chunked::<u8>("frames", &[2, 2], &[3, 2, 2])
+            .unwrap();
+        w.start_swmr().unwrap();
+        // One full band (frames 0..3) and one frame of the next.
+        for f in 0..4u8 {
+            let v = 4 * f + 1;
+            w.append_frame(ds, &[v, v + 1, v + 2, v + 3]).unwrap();
+        }
+        drop(w);
+    }
+
+    let mut r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
+    assert_eq!(r.dataset_shape("frames").unwrap(), vec![4, 2, 2]);
+    assert_eq!(
+        r.read_dataset::<u8>("frames").unwrap(),
+        (1u8..=16).collect::<Vec<_>>()
+    );
+
+    cleanup(&path);
+}
+
+/// A flush publishes the frames of a band still filling, not just the
+/// extent that counts them: a reader opened after each flush sees every
+/// appended frame, through the band completing and the next one starting.
+#[test]
+fn a_flush_publishes_a_partial_band() {
+    let path = unique_tmp("flush_band");
+    let mut w = SwmrFileWriter::create_with_locking(&path, NO_LOCK).unwrap();
+    let ds = w
+        .create_streaming_dataset_chunked::<u8>("frames", &[2, 2], &[3, 2, 2])
+        .unwrap();
+    w.start_swmr().unwrap();
+    let frame = |f: u8| {
+        let v = 4 * f + 1;
+        [v, v + 1, v + 2, v + 3]
+    };
+    let published = |n: u8| -> Vec<u8> { (0..n).flat_map(frame).collect() };
+
+    // Two frames: a partial first band.
+    w.append_frame(ds, &frame(0)).unwrap();
+    w.append_frame(ds, &frame(1)).unwrap();
+    w.flush().unwrap();
+    let mut r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
+    assert_eq!(r.dataset_shape("frames").unwrap(), vec![2, 2, 2]);
+    assert_eq!(r.read_dataset::<u8>("frames").unwrap(), published(2));
+
+    // Two more: the first band completes, the second starts.
+    w.append_frame(ds, &frame(2)).unwrap();
+    w.append_frame(ds, &frame(3)).unwrap();
+    w.flush().unwrap();
+    let mut r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
+    assert_eq!(r.dataset_shape("frames").unwrap(), vec![4, 2, 2]);
+    assert_eq!(r.read_dataset::<u8>("frames").unwrap(), published(4));
+
+    // A flush with nothing new to say changes nothing.
+    w.flush().unwrap();
+    w.close().unwrap();
+    let mut r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
+    assert_eq!(r.read_dataset::<u8>("frames").unwrap(), published(4));
+
+    cleanup(&path);
+}
+
+/// `start_swmr` publishes the extent, which counts the frames of a band
+/// still filling, so it writes that band first: a reader attaching right
+/// after it sees the frames, not fill.
+#[test]
+fn start_swmr_publishes_a_partial_band() {
+    let path = unique_tmp("start_band");
+    let mut w = SwmrFileWriter::create_with_locking(&path, NO_LOCK).unwrap();
+    let ds = w
+        .create_streaming_dataset_chunked::<u8>("frames", &[2, 2], &[3, 2, 2])
+        .unwrap();
+    let frame = |f: u8| {
+        let v = 4 * f + 1;
+        [v, v + 1, v + 2, v + 3]
+    };
+    let published = |n: u8| -> Vec<u8> { (0..n).flat_map(frame).collect() };
+    w.append_frame(ds, &frame(0)).unwrap();
+    w.append_frame(ds, &frame(1)).unwrap();
+    w.start_swmr().unwrap();
+    let mut r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
+    assert_eq!(r.dataset_shape("frames").unwrap(), vec![2, 2, 2]);
+    assert_eq!(r.read_dataset::<u8>("frames").unwrap(), published(2));
+
+    // The band completes after the switch and is written whole.
+    w.append_frame(ds, &frame(2)).unwrap();
+    w.flush().unwrap();
+    let mut r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
+    assert_eq!(r.read_dataset::<u8>("frames").unwrap(), published(3));
+    w.close().unwrap();
+
+    cleanup(&path);
+}
+
 /// Resuming a multi-frame-chunk dataset (`chunk[0] > 1`) after `open_append`
 /// is rejected with a clear error rather than corrupting the chunk grid.
 #[test]
@@ -261,7 +448,7 @@ fn dataset_array_attribute_round_trips() {
 
     // SWMR reader sees the attribute name.
     {
-        let r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
+        let mut r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
         assert!(
             r.dataset_attr_names("axis")
                 .unwrap()
@@ -278,8 +465,10 @@ fn dataset_array_attribute_round_trips() {
         let raw = ds.attr("NDArrayDimOffset").unwrap().read_raw().unwrap();
         assert_eq!(raw.len(), 3 * 4);
         let got: Vec<i32> = raw
-            .chunks_exact(4)
-            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| i32::from_le_bytes(*b))
             .collect();
         assert_eq!(got, vec![0, 4, 8]);
     }
@@ -330,7 +519,7 @@ fn grid_dataset_positioned_writes_round_trip() {
 
     // SWMR reader sees the full bounded shape.
     {
-        let r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
+        let mut r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
         assert_eq!(r.dataset_shape("grid").unwrap(), vec![NA, NB, H, W]);
     }
 
@@ -398,5 +587,137 @@ fn grid_dataset_positioned_write_rejects_misuse() {
     );
 
     w.close().unwrap();
+    cleanup(&path);
+}
+
+/// Under SWMR a relocated chunk's old block must stay intact for readers still
+/// holding the previous index, so the allocator cannot recycle it. An
+/// unfiltered chunk therefore has only one way not to grow the file on
+/// rewrite: overwrite the block it already occupies (libhdf5 does the same —
+/// `H5D__chunk_flush_entry` leaves `must_alloc` false when the address is
+/// already defined and no filter changes the stored size).
+#[test]
+fn swmr_chunk_rewrite_does_not_grow_the_file() {
+    const H: u64 = 4;
+    const W: u64 = 4;
+    let chunk = |v: u16| -> Vec<u8> {
+        (0..(H * W) as u16)
+            .flat_map(|p| (v + p).to_le_bytes())
+            .collect()
+    };
+
+    // Same file, written once vs rewritten eight times over.
+    let write = |label: &str, rewrites: u16| -> (PathBuf, u64) {
+        let path = unique_tmp(label);
+        {
+            let mut w = SwmrFileWriter::create_with_locking(&path, NO_LOCK).unwrap();
+            let ds = w
+                .create_grid_dataset::<u16>("grid", &[1, 1, H, W], &[1, 1, H, W])
+                .unwrap();
+            w.start_swmr().unwrap();
+            for v in 1..=rewrites {
+                w.write_chunk_at(ds, &[0, 0, 0, 0], &chunk(v * 100))
+                    .unwrap();
+                w.flush().unwrap();
+            }
+            w.close().unwrap();
+        }
+        let size = std::fs::metadata(&path).unwrap().len();
+        (path, size)
+    };
+
+    let (once_path, once) = write("swmr_rewrite_1", 1);
+    let (many_path, many) = write("swmr_rewrite_8", 8);
+    assert_eq!(
+        many, once,
+        "8 SWMR rewrites of one chunk grew the file past a single write"
+    );
+
+    // The last write is the one that survives.
+    let mut r = SwmrFileReader::open_with_locking(&many_path, NO_LOCK).unwrap();
+    let data: Vec<u16> = r.read_dataset("grid").unwrap();
+    assert_eq!(data[0], 800);
+    drop(r);
+
+    cleanup(&once_path);
+    cleanup(&many_path);
+}
+
+/// Boundary: the typed reads check `T` against the stored element width.
+/// An f64 dataset read as `i32` used to pass the divisibility check and
+/// return twice as many garbage values.
+#[test]
+fn typed_reads_reject_a_mismatched_element_width() {
+    let path = unique_tmp("typed_width");
+    {
+        let mut w = SwmrFileWriter::create_with_locking(&path, NO_LOCK).unwrap();
+        w.write_dataset::<f64>("d", &[2], &[1.5, -2.25]).unwrap();
+        w.close().unwrap();
+    }
+    let mut r = SwmrFileReader::open_with_locking(&path, NO_LOCK).unwrap();
+    assert_eq!(r.read_dataset::<f64>("d").unwrap(), vec![1.5, -2.25]);
+
+    let err = r.read_dataset::<i32>("d").unwrap_err();
+    assert!(
+        err.to_string().contains("element size"),
+        "unexpected error: {err}"
+    );
+    let err = r.read_slice::<i32>("d", &[0], &[1]).unwrap_err();
+    assert!(
+        err.to_string().contains("element size"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(r.read_slice::<f64>("d", &[1], &[1]).unwrap(), vec![-2.25]);
+    cleanup(&path);
+}
+
+/// Every attribute mutation after `start_swmr` is refused, libhdf5's rule
+/// for SWMR writes. Object headers are frozen once streaming starts, so a
+/// change only reached the file when its header happened to be rebuilt at
+/// close (group attrs always, dataset attrs only alongside chunk writes)
+/// and was silently dropped otherwise — and replacing a vlen value
+/// stranded its old 4096-byte collection forever, since a streaming
+/// reader may still hold the references.
+#[test]
+fn attribute_changes_during_swmr_are_refused() {
+    let path = unique_tmp("swmr_attr_freeze");
+    {
+        let mut w = SwmrFileWriter::create_with_locking(&path, NO_LOCK).unwrap();
+        w.create_group("/", "entry").unwrap();
+        w.set_group_attr_string("/entry", "NX_class", "NXentry")
+            .unwrap();
+        let ds = w.create_streaming_dataset::<i32>("frames", &[4]).unwrap();
+        w.set_dataset_attr_string(ds, "units", "mm").unwrap();
+        w.set_dataset_attr_numeric(ds, "scale", &2i32).unwrap();
+        w.start_swmr().unwrap();
+
+        let err = w
+            .set_group_attr_string("/entry", "NX_class", "NXdata")
+            .expect_err("vlen replace under SWMR must be refused");
+        assert!(format!("{err}").contains("SWMR"), "got: {err}");
+        w.set_dataset_attr_string(ds, "units", "cm")
+            .expect_err("vlen replace under SWMR must be refused");
+        w.set_dataset_attr_string(ds, "long_name", "detector x")
+            .expect_err("a new vlen attribute under SWMR must be refused");
+        w.set_dataset_attr_numeric(ds, "scale", &3i32)
+            .expect_err("a numeric replace under SWMR must be refused");
+        w.close().unwrap();
+    }
+
+    // No stranded collection: the refused post-start calls must not have
+    // written a heap block. The two pre-start vlen attrs pack into one
+    // shared collection, so exactly one "GCOL" may appear.
+    let bytes = std::fs::read(&path).unwrap();
+    let gcols = bytes.windows(4).filter(|w| *w == b"GCOL").count();
+    assert_eq!(gcols, 1, "only the shared pre-start collection may exist");
+
+    // The pre-start values are what the file holds.
+    let file = rust_hdf5::H5File::open(&path).unwrap();
+    let entry = file.root_group().group("entry").unwrap();
+    assert_eq!(entry.attr_string("NX_class").unwrap(), "NXentry");
+    let ds = file.dataset("frames").unwrap();
+    assert_eq!(ds.attr("units").unwrap().read_string().unwrap(), "mm");
+    assert_eq!(ds.attr("scale").unwrap().read_numeric::<i32>().unwrap(), 2);
+    drop(file);
     cleanup(&path);
 }

@@ -18,13 +18,14 @@ Read and write HDF5 files with contiguous, chunked, and compressed datasets, hie
 - **Chunked storage** — extensible array, fixed array, B-tree v2 indices
 - **Compression** — deflate (gzip), shuffle, Fletcher-32, LZ4, Zstandard filters
 - **Parallel compression** — per-chunk compression/decompression via rayon
+- **SIMD filter kernels** — default `simd` feature: shuffle, bitshuffle and Fletcher-32 dispatch on the CPU level detected at run time (AVX2/AVX-512, NEON) via `fearless_simd`
 - **Groups** — hierarchical group structure with nested object headers
-- **Attributes** — string and numeric attributes on datasets and root
+- **Attributes** — string, numeric and object-reference attributes on datasets, groups and root; dimension scales (`set_scale` / `attach_scale`) readable by h5py's `dims`
 - **SWMR** — Single Writer / Multiple Reader streaming protocol
 - **File locking** — OS-level advisory locks (`flock` / `LockFileEx`) honoring `HDF5_USE_FILE_LOCKING`
-- **Hyperslab I/O** — `read_slice` / `write_slice` for partial N-dimensional access
+- **Hyperslab I/O** — `read_slice` / `write_slice` for partial N-dimensional access, on contiguous and chunked (including compressed) datasets
 - **Buffered I/O** — BufWriter/BufReader with automatic mode switching
-- **Memory-mapped I/O** — optional zero-copy read-only access via `mmap` feature
+- **Memory-mapped I/O** — optional `mmap` feature: a read-only open that holds the shared file lock serves its small reads from a memory map
 - **Thread safety** — optional `threadsafe` feature (`Arc<Mutex>` instead of `Rc<RefCell>`)
 - **Legacy format support** — reads v0/v1 superblock and v1 object header files (h5py, HDF5 C library)
 - **Variable-length strings** — read and write h5py-compatible vlen string datasets via global heap
@@ -34,7 +35,7 @@ Read and write HDF5 files with contiguous, chunked, and compressed datasets, hie
 
 ```toml
 [dependencies]
-rust-hdf5 = "0.2"
+rust-hdf5 = "0.6"
 ```
 
 > Requires Rust 1.89+ (uses `std::fs::File::lock` for cross-platform
@@ -150,6 +151,13 @@ let region = ds.read_slice::<i32>(&[2, 3], &[2, 3])?;
 assert_eq!(region, vec![1, 2, 3, 4, 5, 6]);
 ```
 
+`write_slice` also works on chunked datasets, including compressed ones: it
+touches only the chunks the selection intersects, reading and rewriting a
+chunk in place when the selection covers it only partially. Updating one row
+of a large chunked dataset therefore costs one chunk's worth of I/O, not the
+whole dataset's. Chunk regions no write has reached read back as the fill
+value.
+
 ### Attributes
 
 ```rust
@@ -261,8 +269,15 @@ for ensuring no second writer attaches during streaming.
 ```toml
 # Enable LZ4 + Zstandard
 [dependencies]
-rust-hdf5 = { version = "0.2", features = ["lz4", "zstd"] }
+rust-hdf5 = { version = "0.6", features = ["lz4", "zstd"] }
 ```
+
+Filters apply to every chunked layout, whichever chunk index the dataspace
+selects: a fixed array (no unlimited dimension), an extensible array (exactly
+one), or a v2 B-tree (two or more). Already-filtered bytes can be handed over
+verbatim with a per-chunk filter mask — HDF5's direct chunk write — via
+`write_chunk_raw` (linear index) or `write_chunk_raw_at` (grid coordinates,
+and the form a v2-B-tree dataset uses).
 
 ## Feature flags
 
@@ -276,7 +291,8 @@ rust-hdf5 = { version = "0.2", features = ["lz4", "zstd"] }
 | `all_filters` | All compression filters |
 | `parallel` | Parallel chunk compression via rayon |
 | `threadsafe` | `Send + Sync` file handles (`Arc<Mutex>`) |
-| `mmap` | Memory-mapped read-only file access |
+| `mmap` | Read-only opens that hold the file lock serve reads from a memory map |
+| `simd` | Run-time dispatched SIMD kernels for the shuffle, bitshuffle and Fletcher-32 filters (default) |
 
 ## HDF5 format support
 

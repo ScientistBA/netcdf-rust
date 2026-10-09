@@ -120,11 +120,130 @@ fn bench_compressed_write(c: &mut Criterion) {
     group.finish();
 }
 
+// Read back a many-chunk deflate-compressed dataset. This is the path where
+// per-chunk decompression (and, potentially, per-chunk disk reads) can be
+// parallelized: compare `--features parallel` against the default to see the
+// effect. Higher chunk count + wider chunks make the decompression cost, rather
+// than fixed overhead, dominate.
+fn bench_compressed_read(c: &mut Criterion) {
+    let mut group = c.benchmark_group("compressed_read");
+    for &nframes in &[100usize, 1000] {
+        let ncols = 1000usize;
+        let total_bytes = nframes * ncols * 8;
+
+        // Prepare a file with `nframes` chunks, one row (1000 f64) per chunk.
+        let path = std::env::temp_dir().join(format!("bench_compressed_read_{}.h5", nframes));
+        {
+            let file = H5File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<f64>()
+                .shape([0, ncols])
+                .chunk(&[1, ncols])
+                .max_shape(&[None, Some(ncols)])
+                .deflate(6)
+                .create("stream")
+                .unwrap();
+            for frame in 0..nframes {
+                let vals: Vec<f64> = (0..ncols).map(|i| (frame * ncols + i) as f64).collect();
+                let raw: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+                ds.write_chunk(frame, &raw).unwrap();
+            }
+            ds.extend(&[nframes, ncols]).unwrap();
+            file.close().unwrap();
+        }
+
+        group.throughput(Throughput::Bytes(total_bytes as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(nframes), &nframes, |b, _| {
+            b.iter(|| {
+                let file = H5File::open(&path).unwrap();
+                let ds = file.dataset("stream").unwrap();
+                let _data = ds.read_raw::<f64>().unwrap();
+            });
+        });
+
+        std::fs::remove_file(&path).ok();
+    }
+    group.finish();
+}
+
+// write_raw a whole many-chunk deflate-compressed extensible-array dataset.
+// This drives write_full_image_chunked's windowed batch path, where the filter
+// pipeline compresses chunks in parallel under `--features parallel`.
+fn bench_compressed_write_raw(c: &mut Criterion) {
+    let mut group = c.benchmark_group("compressed_write_raw");
+    for &nframes in &[100usize, 1000] {
+        let ncols = 1000usize;
+        let total_bytes = nframes * ncols * 8;
+        let data: Vec<f64> = (0..nframes * ncols).map(|i| i as f64).collect();
+        group.throughput(Throughput::Bytes(total_bytes as u64));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(nframes),
+            &nframes,
+            |b, &nframes| {
+                b.iter(|| {
+                    let path = std::env::temp_dir().join("bench_compressed_write_raw.h5");
+                    let file = H5File::create(&path).unwrap();
+                    let ds = file
+                        .new_dataset::<f64>()
+                        .shape([nframes, ncols])
+                        .chunk(&[1, ncols])
+                        .max_shape(&[None, Some(ncols)])
+                        .deflate(6)
+                        .create("stream")
+                        .unwrap();
+                    ds.write_raw(&data).unwrap();
+                    file.close().unwrap();
+                    std::fs::remove_file(&path).ok();
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+// write_raw a whole many-chunk deflate-compressed fixed-array dataset (bounded
+// shape, no unlimited dimension). This drives the fixed-array batch path, where
+// the filter pipeline compresses chunks in parallel under `--features parallel`.
+fn bench_compressed_write_raw_fixed(c: &mut Criterion) {
+    let mut group = c.benchmark_group("compressed_write_raw_fixed");
+    for &nframes in &[100usize, 1000] {
+        let ncols = 1000usize;
+        let total_bytes = nframes * ncols * 8;
+        let data: Vec<f64> = (0..nframes * ncols).map(|i| i as f64).collect();
+        group.throughput(Throughput::Bytes(total_bytes as u64));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(nframes),
+            &nframes,
+            |b, &nframes| {
+                b.iter(|| {
+                    let path = std::env::temp_dir().join("bench_compressed_write_raw_fixed.h5");
+                    let file = H5File::create(&path).unwrap();
+                    // No max_shape -> no unlimited dim -> fixed-array index.
+                    let ds = file
+                        .new_dataset::<f64>()
+                        .shape([nframes, ncols])
+                        .chunk(&[1, ncols])
+                        .deflate(6)
+                        .create("grid")
+                        .unwrap();
+                    ds.write_raw(&data).unwrap();
+                    file.close().unwrap();
+                    std::fs::remove_file(&path).ok();
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_contiguous_write,
     bench_contiguous_read,
     bench_chunked_write,
     bench_compressed_write,
+    bench_compressed_read,
+    bench_compressed_write_raw,
+    bench_compressed_write_raw_fixed,
 );
 criterion_main!(benches);

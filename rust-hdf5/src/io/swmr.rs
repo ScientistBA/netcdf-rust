@@ -27,8 +27,22 @@ struct BandBuffer {
     tile_dims: Vec<u64>,
     /// Element size in bytes.
     elem_size: usize,
-    /// Whole frames accumulated for the current (not-yet-full) band.
+    /// Whole frames the extent already counts whose band is not written
+    /// yet, oldest first. The first one sits on a band boundary: frames
+    /// leave only a whole band at a time, so the buffer holds zero or more
+    /// complete bands followed by the one still filling.
     frames: Vec<Vec<u8>>,
+}
+
+/// What a band write does with the band still filling.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tail {
+    /// Leave it buffered: an append publishes only the bands that
+    /// completed.
+    Leave,
+    /// Write it too, zero-padded, so a reader sees every frame the extent
+    /// counts: a flush, `start_swmr`, and the last write at close.
+    Write,
 }
 
 /// SWMR writer wrapping an Hdf5Writer.
@@ -345,7 +359,12 @@ impl SwmrWriter {
     /// root group, and the superblock with SWMR flags. After this call,
     /// readers can open the file in SWMR mode. Subsequent data writes use
     /// in-place header updates via `flush()`.
+    ///
+    /// The headers published here count every frame a multi-frame-chunk
+    /// dataset has buffered, so the bands those frames sit in are written
+    /// first, zero-padded, as `flush` writes them.
     pub fn start_swmr(&mut self) -> IoResult<()> {
+        self.write_band_buffers(Tail::Write)?;
         self.writer.finalize_for_swmr()?;
         // Release the writer's exclusive lock so concurrent SWMR readers
         // can attach. Note: the SWMR protocol assumes a single writer —
@@ -378,7 +397,7 @@ impl SwmrWriter {
         }
 
         // Current frame count (dim 0).
-        let frame_idx = self.writer.datasets[ds_index].dataspace.dims[0];
+        let frame_idx = self.writer.ds(ds_index).lock().dataspace.dims[0];
 
         let dims = self.writer.dataset_dims(ds_index).to_vec();
         let chunk_dims = self
@@ -404,7 +423,7 @@ impl SwmrWriter {
         }
 
         // `data` must hold exactly one frame.
-        let elem_size = self.writer.datasets[ds_index].datatype.element_size() as usize;
+        let elem_size = self.writer.ds(ds_index).lock().datatype.element_size() as usize;
         let frame_elems: u64 = dims[1..].iter().product();
         let expected = frame_elems as usize * elem_size;
         if data.len() != expected {
@@ -438,7 +457,7 @@ impl SwmrWriter {
         }
 
         // 2. Extend dimensions.
-        let mut new_dims = self.writer.datasets[ds_index].dataspace.dims.clone();
+        let mut new_dims = self.writer.ds(ds_index).lock().dataspace.dims.clone();
         new_dims[0] = frame_idx + 1;
         self.writer.extend_dataset(ds_index, &new_dims)?;
 
@@ -459,7 +478,7 @@ impl SwmrWriter {
         chunk_coords: &[u64],
         data: &[u8],
     ) -> IoResult<()> {
-        if self.writer.datasets[ds_index].fixed_array.is_none() {
+        if self.writer.ds(ds_index).lock().fixed_array.is_none() {
             return Err(crate::io::IoError::InvalidState(
                 "write_chunk_at requires a fixed grid dataset (create_grid_dataset)".into(),
             ));
@@ -484,84 +503,103 @@ impl SwmrWriter {
             )));
         }
 
-        self.band_buffers
-            .get_mut(&ds_index)
-            .expect("band buffer present")
-            .frames
-            .push(data.to_vec());
-
-        // The logical frame count tracks the exact number appended.
-        let frame_idx = self.writer.datasets[ds_index].dataspace.dims[0];
-        let mut new_dims = self.writer.datasets[ds_index].dataspace.dims.clone();
-        new_dims[0] = frame_idx + 1;
+        // The extent counts every buffered frame, so it grows before the
+        // frame is buffered: an extent that cannot grow leaves the buffer as
+        // it was.
+        let mut new_dims = self.writer.ds(ds_index).lock().dataspace.dims.clone();
+        new_dims[0] += 1;
         self.writer.extend_dataset(ds_index, &new_dims)?;
+        let bb = self
+            .band_buffers
+            .get_mut(&ds_index)
+            .expect("band buffer present");
+        bb.frames.push(data.to_vec());
 
-        // A full band is written immediately.
-        if self.band_buffers[&ds_index].frames.len() as u64 == frames_per_chunk {
-            self.write_band(ds_index)?;
+        // A band that completed is written now. `>=`, not `==`: a write that
+        // failed left its band in the buffer, and the next append retries it
+        // along with whatever completed since.
+        if bb.frames.len() as u64 >= frames_per_chunk {
+            self.write_band(ds_index, Tail::Leave)?;
         }
         Ok(())
     }
 
-    /// Assemble and write every chunk of the currently buffered band of a
-    /// multi-frame-chunk dataset, then clear the buffer. A band shorter than
-    /// `frames_per_chunk` (the final band at close) yields zero-padded
-    /// chunks; the dataset's logical extent is not changed.
-    fn write_band(&mut self, ds_index: usize) -> IoResult<()> {
-        let (frames, n, frame_dims, tile_dims, elem_size) = {
-            let bb = self
-                .band_buffers
-                .get_mut(&ds_index)
-                .expect("band buffer present");
-            if bb.frames.is_empty() {
-                return Ok(());
-            }
-            (
-                std::mem::take(&mut bb.frames),
-                bb.frames_per_chunk,
-                bb.frame_dims.clone(),
-                bb.tile_dims.clone(),
-                bb.elem_size,
-            )
-        };
+    /// Assemble and write the chunks of every band a multi-frame-chunk
+    /// dataset's buffer holds: each complete band whole, and the one still
+    /// filling zero-padded when `tail` says so. The dataset's logical extent
+    /// is not changed.
+    ///
+    /// A complete band leaves the buffer once every chunk of the write is
+    /// down; the band still filling stays, whether or not it was written,
+    /// for its final write when it completes (or at close). A write that
+    /// fails leaves the buffer as it was, so the next write, from an append,
+    /// a flush or close, puts the same chunks down again: a band's position
+    /// is the extent's, not the buffer's, and the rewrite is idempotent.
+    fn write_band(&mut self, ds_index: usize, tail: Tail) -> IoResult<()> {
+        let bb = self
+            .band_buffers
+            .get_mut(&ds_index)
+            .expect("band buffer present");
+        if bb.frames.is_empty() {
+            return Ok(());
+        }
+        let n = bb.frames_per_chunk as usize;
+        let count = bb.frames.len();
+        // The extent counts every buffered frame, so the buffer starts at
+        // `dim0 - count`, and that is a band boundary (`BandBuffer::frames`).
+        let dim0 = self.writer.ds(ds_index).lock().dataspace.dims[0];
+        let first_band = (dim0 - count as u64) / bb.frames_per_chunk;
 
-        let count = frames.len() as u64;
-        // Band index: the logical extent already counts every appended
-        // frame, so the band starts at `dim0 - count`.
-        let dim0 = self.writer.datasets[ds_index].dataspace.dims[0];
-        let band = (dim0 - count) / n;
-
-        let k = frame_dims.len();
+        let k = bb.frame_dims.len();
         let grid: Vec<u64> = (0..k)
-            .map(|d| frame_dims[d].div_ceil(tile_dims[d]))
+            .map(|d| bb.frame_dims[d].div_ceil(bb.tile_dims[d]))
             .collect();
-        let cells: u64 = grid.iter().product();
-        let tile_bytes = tile_dims.iter().product::<u64>() as usize * elem_size;
+        let cells = grid.iter().product::<u64>() as usize;
+        let tile_bytes = bb.tile_dims.iter().product::<u64>() as usize * bb.elem_size;
 
         // Split each frame into its tiles once (row-major cell order).
-        let per_frame_tiles: Vec<Vec<Vec<u8>>> = frames
+        let per_frame_tiles: Vec<Vec<Vec<u8>>> = bb
+            .frames
             .iter()
-            .map(|f| split_frame_into_tiles(f, &frame_dims, &tile_dims, elem_size))
+            .map(|f| split_frame_into_tiles(f, &bb.frame_dims, &bb.tile_dims, bb.elem_size))
             .collect();
 
-        // For each tile-grid cell, assemble the [n, tile...] chunk: frame
-        // `s` occupies frame-slot `s`; slots `count..n` stay zero-padded.
-        for cell in 0..cells as usize {
-            let mut chunk = vec![0u8; n as usize * tile_bytes];
-            for (s, frame_tiles) in per_frame_tiles.iter().enumerate() {
-                chunk[s * tile_bytes..(s + 1) * tile_bytes].copy_from_slice(&frame_tiles[cell]);
+        let complete = count / n;
+        let written = match tail {
+            Tail::Leave => complete * n,
+            Tail::Write => count,
+        };
+        // For each band and each tile-grid cell, assemble the [n, tile...]
+        // chunk: frame `s` of the band occupies frame-slot `s`, and the slots
+        // past a band still filling stay zero-padded.
+        for (b, band_frames) in per_frame_tiles[..written].chunks(n).enumerate() {
+            let band = first_band + b as u64;
+            for cell in 0..cells {
+                let mut chunk = vec![0u8; n * tile_bytes];
+                for (s, frame_tiles) in band_frames.iter().enumerate() {
+                    chunk[s * tile_bytes..(s + 1) * tile_bytes].copy_from_slice(&frame_tiles[cell]);
+                }
+                let linear = band * cells as u64 + cell as u64;
+                self.writer.write_chunk(ds_index, linear, &chunk)?;
             }
-            let linear = band * cells + cell as u64;
-            self.writer.write_chunk(ds_index, linear, &chunk)?;
         }
+        bb.frames.drain(..complete * n);
         Ok(())
     }
 
-    /// Write the final partial band of every multi-frame-chunk dataset.
-    fn flush_band_buffers(&mut self) -> IoResult<()> {
+    /// [`write_band`](Self::write_band) for every multi-frame-chunk dataset.
+    ///
+    /// A deleted dataset is skipped, the rule `flush` applies to its header
+    /// and index, and its buffer goes with it: the frames have nowhere to go,
+    /// and a buffer left behind would fail every later write here.
+    fn write_band_buffers(&mut self, tail: Tail) -> IoResult<()> {
         let indices: Vec<usize> = self.band_buffers.keys().copied().collect();
         for ds_index in indices {
-            self.write_band(ds_index)?;
+            if self.writer.ds(ds_index).lock().deleted {
+                self.band_buffers.remove(&ds_index);
+                continue;
+            }
+            self.write_band(ds_index, tail)?;
         }
         Ok(())
     }
@@ -572,15 +610,38 @@ impl SwmrWriter {
     /// 1. Flush EA index structures -> fsync
     /// 2. Re-write dataset object headers in place (updated dataspace) -> fsync
     /// 3. Re-write superblock (updated EOF) -> fsync
+    ///
+    /// A deleted dataset is skipped by both loops, the rule both finalize
+    /// paths already follow: `release_dataset_storage` returned that dataset's
+    /// header block and index blocks to the allocator, so writing either back
+    /// puts an object header over whatever now owns the block.
+    ///
+    /// A band a multi-frame-chunk dataset is still filling is written first,
+    /// zero-padded, so a reader sees the frames the extent already counts
+    /// (see `write_band`); its chunks are written again, whole, when the band
+    /// completes. For a filtered dataset a rewrite whose compressed size
+    /// changed takes a new block and keeps the old one for a reader that may
+    /// still hold its address (the `H5D__chunk_file_alloc` rule under SWMR),
+    /// so every flush of a partial filtered band costs that band's chunks in
+    /// file space for the rest of the session.
     pub fn flush(&mut self) -> IoResult<()> {
+        // Step 0: The extent already counts every frame a band buffer holds,
+        // and the headers written below publish that extent; a band still
+        // filling is written zero-padded first, and kept, so the frames a
+        // reader is told about are frames it can read.
+        self.write_band_buffers(Tail::Write)?;
+
         // Step 1: Flush chunk index structures for all chunked datasets —
         // extensible array (streaming), fixed array (fixed grid), and v2
         // B-tree alike, matching finalize_for_swmr.
-        for i in 0..self.writer.datasets.len() {
-            if self.writer.datasets[i].chunked.is_some()
-                || self.writer.datasets[i].fixed_array.is_some()
-                || self.writer.datasets[i].btree_v2.is_some()
-            {
+        for i in 0..self.writer.dataset_count() {
+            let is_indexed = {
+                let ds = self.writer.ds(i);
+                let m = ds.lock();
+                !m.deleted
+                    && (m.chunked.is_some() || m.fixed_array.is_some() || m.btree_v2.is_some())
+            };
+            if is_indexed {
                 self.writer.flush_dataset(i)?;
             }
         }
@@ -588,8 +649,13 @@ impl SwmrWriter {
 
         if self.swmr_active {
             // Step 2: Re-write dataset object headers in place with updated dims.
-            for i in 0..self.writer.datasets.len() {
-                if self.writer.datasets[i].obj_header_written_addr.is_some() {
+            for i in 0..self.writer.dataset_count() {
+                let rewrite = {
+                    let ds = self.writer.ds(i);
+                    let m = ds.lock();
+                    !m.deleted && m.obj_header_written_addr.is_some()
+                };
+                if rewrite {
                     self.writer.write_dataset_header_inplace(i)?;
                 }
             }
@@ -614,8 +680,39 @@ impl SwmrWriter {
     /// Any partially filled multi-frame chunk band is written (zero-padded)
     /// before the file is finalized.
     pub fn close(mut self) -> IoResult<()> {
-        self.flush_band_buffers()?;
-        self.writer.close()
+        let drained = self.write_band_buffers(Tail::Write);
+        // A band the drain could not write is lost with the error returned
+        // here; left in the buffer, `Drop` would retry the same write and
+        // print over the error the caller is already handling.
+        self.band_buffers.clear();
+        // The file is finalized whatever the drain did, and marked closed by
+        // it, so that `Drop` does not finalize it a second time and print
+        // over the error returned here.
+        let closed = self.writer.close_in_place();
+        match (drained, closed) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
+            (Err(drain), Err(close)) => Err(crate::io::IoError::InvalidState(format!(
+                "{drain}; finalizing the file then failed too: {close}"
+            ))),
+        }
+    }
+}
+
+impl Drop for SwmrWriter {
+    fn drop(&mut self) {
+        // The band buffers are this type's, not the writer's, so the writer's
+        // own finalizer cannot see them: every frame in one has already been
+        // counted into its dataset's extent, and would read back as fill if
+        // the file were finalized around it. Drain them here, ahead of the
+        // field drop that finalizes the file; after `close` they are empty.
+        if let Err(e) = self.write_band_buffers(Tail::Write) {
+            eprintln!(
+                "rust-hdf5: failed to write the buffered frames of a multi-frame-chunk \
+                 dataset on drop: {e}. Those frames read back as fill; call \
+                 SwmrWriter::close() to handle this error explicitly."
+            );
+        }
     }
 }
 
@@ -797,6 +894,86 @@ mod swmr_hardlink_tests {
         assert_eq!(r.read_dataset_raw("alias").unwrap(), vec![1u8, 2, 3, 4]);
     }
 
+    /// A buffer holding more than a band, which is what a band write that
+    /// failed leaves behind: the next write puts down every complete band
+    /// whole and, from a flush, the band still filling padded, and only that
+    /// band stays buffered.
+    #[test]
+    fn a_buffer_holding_more_than_a_band_writes_every_band() {
+        let dir = TmpDir::new("bands");
+        let path = dir.file();
+        let frame = |f: u8| vec![4 * f + 1, 4 * f + 2, 4 * f + 3, 4 * f + 4];
+        let frames = |n: u8| -> Vec<u8> { (0..n).flat_map(frame).collect() };
+        {
+            let mut w = SwmrWriter::create(&path).unwrap();
+            let idx = w
+                .create_streaming_dataset_chunked(
+                    "frames",
+                    DatatypeMessage::u8_type(),
+                    &[2, 2],
+                    &[3, 2, 2],
+                )
+                .unwrap();
+            w.start_swmr().unwrap();
+            w.append_frame(idx, &frame(0)).unwrap();
+            w.append_frame(idx, &frame(1)).unwrap();
+            // The state a failed completing write leaves: frames 2 and 3
+            // counted into the extent and buffered, nothing written.
+            for f in 2..4 {
+                let mut dims = w.writer.ds(idx).lock().dataspace.dims.clone();
+                dims[0] += 1;
+                w.writer.extend_dataset(idx, &dims).unwrap();
+                w.band_buffers.get_mut(&idx).unwrap().frames.push(frame(f));
+            }
+            assert_eq!(w.band_buffers[&idx].frames.len(), 4);
+
+            w.flush().unwrap();
+            assert_eq!(w.band_buffers[&idx].frames.len(), 1);
+            let mut r = Hdf5Reader::open_swmr_with_locking(
+                &path,
+                crate::io::locking::FileLocking::Disabled,
+            )
+            .unwrap();
+            assert_eq!(r.read_dataset_raw("frames").unwrap(), frames(4));
+
+            // Completing the second band writes it whole and empties the
+            // buffer.
+            w.append_frame(idx, &frame(4)).unwrap();
+            w.append_frame(idx, &frame(5)).unwrap();
+            assert!(w.band_buffers[&idx].frames.is_empty());
+            w.close().unwrap();
+        }
+        let mut r = Hdf5Reader::open(&path).unwrap();
+        assert_eq!(r.read_dataset_raw("frames").unwrap(), frames(6));
+    }
+
+    /// A dataset deleted with frames buffered takes its band buffer with it:
+    /// the frames have nowhere to go, and a buffer left behind would fail
+    /// every later band write with the dataset's missing chunk index.
+    #[test]
+    fn a_deleted_dataset_takes_its_band_buffer_with_it() {
+        let dir = TmpDir::new("deleted_band");
+        let path = dir.file();
+        let mut w = SwmrWriter::create(&path).unwrap();
+        let idx = w
+            .create_streaming_dataset_chunked(
+                "frames",
+                DatatypeMessage::u8_type(),
+                &[2, 2],
+                &[3, 2, 2],
+            )
+            .unwrap();
+        w.append_frame(idx, &[1u8, 2, 3, 4]).unwrap();
+        w.append_frame(idx, &[5u8, 6, 7, 8]).unwrap();
+        w.writer_mut().delete_dataset("frames").unwrap();
+        w.start_swmr().unwrap();
+        assert!(!w.band_buffers.contains_key(&idx));
+        w.flush().unwrap();
+        w.close().unwrap();
+        let r = Hdf5Reader::open(&path).unwrap();
+        assert!(r.dataset_names().is_empty());
+    }
+
     /// Regression: a hard link created AFTER `start_swmr` is a structural
     /// change made during the SWMR window. `close` must commit it via a full
     /// re-finalize (rebuilding group/root headers and the grown target
@@ -832,6 +1009,59 @@ mod swmr_hardlink_tests {
         assert_eq!(r.read_dataset_raw("frames").unwrap(), expect);
         assert_eq!(r.read_dataset_raw("alias").unwrap(), expect);
         assert_eq!(r.dataset_shape("frames").unwrap(), vec![2, 2, 2]);
+    }
+
+    /// Regression: `flush` must leave a deleted dataset alone. Both finalize
+    /// paths skip one, because `release_dataset_storage` has already returned
+    /// its header block to the allocator — a flush that rewrote the header
+    /// would stamp an object header over whatever now owns that block.
+    ///
+    /// The deleted state is set directly rather than through
+    /// `delete_dataset`, which refuses while SWMR streaming is active and
+    /// clears the header address on the way out: what is under test is the
+    /// flush loop's own rule, not the delete path that currently keeps it
+    /// from being exercised.
+    #[test]
+    fn flush_leaves_a_deleted_datasets_header_alone() {
+        let dir = TmpDir::new("deleted");
+        let path = dir.file();
+
+        let mut w = SwmrWriter::create(&path).unwrap();
+        let keep = w
+            .create_streaming_dataset("frames", DatatypeMessage::u8_type(), &[2, 2])
+            .unwrap();
+        let gone = w
+            .create_streaming_dataset("scratch", DatatypeMessage::u8_type(), &[2, 2])
+            .unwrap();
+        w.start_swmr().unwrap();
+        w.append_frame(keep, &[1u8, 2, 3, 4]).unwrap();
+        w.append_frame(gone, &[9u8, 9, 9, 9]).unwrap();
+
+        // Stand in for the block having been reused: the header address holds
+        // bytes that are no longer this dataset's header.
+        let (addr, size) = {
+            let ds = w.writer_mut().ds(gone);
+            let m = ds.lock();
+            let &(addr, size) = m.obj_header_blocks.first().expect("header written");
+            (addr, size as usize)
+        };
+        let sentinel = vec![0xABu8; size];
+        w.writer_mut().handle().write_at(addr, &sentinel).unwrap();
+        w.writer_mut().ds(gone).lock().deleted = true;
+
+        w.flush().unwrap();
+
+        let after = w.writer_mut().handle().read_at(addr, size).unwrap();
+        assert_eq!(
+            after, sentinel,
+            "flush rewrote the object header of a deleted dataset at {addr:#x}"
+        );
+
+        w.close().unwrap();
+        let mut r = Hdf5Reader::open(&path).unwrap();
+        let names: Vec<String> = r.dataset_names().iter().map(|s| s.to_string()).collect();
+        assert_eq!(names, vec!["frames".to_string()]);
+        assert_eq!(r.read_dataset_raw("frames").unwrap(), vec![1u8, 2, 3, 4]);
     }
 
     /// A reader attached during the SWMR window must still resolve the file
@@ -877,6 +1107,38 @@ mod swmr_hardlink_tests {
         assert!(
             names.iter().any(|n| n == "alias"),
             "refreshed reader missing hard link: {names:?}"
+        );
+    }
+
+    /// A read decodes the dataset's chunk index and the reader keeps it, so
+    /// `refresh` has to leave nothing of it behind: the frames appended after
+    /// that read live in chunks the decoded index has no entry for, and after
+    /// the re-finalize at an address nothing in it points at.
+    #[test]
+    fn a_refresh_drops_the_chunk_index_the_last_read_decoded() {
+        use crate::io::locking::FileLocking;
+
+        let dir = TmpDir::new("refresh_index");
+        let path = dir.file();
+
+        let mut w = SwmrWriter::create_with_locking(&path, FileLocking::Disabled).unwrap();
+        let idx = w
+            .create_streaming_dataset("frames", DatatypeMessage::u8_type(), &[2, 2])
+            .unwrap();
+        w.start_swmr().unwrap();
+        w.append_frame(idx, &[1u8, 2, 3, 4]).unwrap();
+        w.flush().unwrap();
+
+        let mut r = Hdf5Reader::open_swmr_with_locking(&path, FileLocking::Disabled).unwrap();
+        assert_eq!(r.read_dataset_raw("frames").unwrap(), vec![1u8, 2, 3, 4]);
+
+        w.append_frame(idx, &[5u8, 6, 7, 8]).unwrap();
+        w.close().unwrap();
+
+        r.refresh().unwrap();
+        assert_eq!(
+            r.read_dataset_raw("frames").unwrap(),
+            vec![1u8, 2, 3, 4, 5, 6, 7, 8]
         );
     }
 
