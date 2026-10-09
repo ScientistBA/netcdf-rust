@@ -6,6 +6,7 @@ members = [
     "netcdf-core",
     "netcdf-reader",
     "netcdf-writer",
+    "rust-hdf5",
 ]
 resolver = "2"
 
