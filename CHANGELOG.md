@@ -11,6 +11,10 @@
 - list a group's children in link creation order when the group tracks it, as
   libhdf5's creation-order index and netcdf-c do, instead of on-disk storage
   order; NetCDF-4 variables now come back in netcdf-c's order
+- read variable-length strings whose base type is a one-byte fixed string (as
+  rust-hdf5 writes them) as well as a one-byte integer (as libhdf5 does); netcdf-c
+  treats both as NC_STRING, but attributes written by rust-hdf5 failed with
+  "unsupported NetCDF-4 datatype"
 
 ## 0.9.1 - 2026-07-28
 

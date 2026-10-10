@@ -1214,3 +1214,28 @@ fn nc4_variables_are_listed_in_creation_order() {
     let names: Vec<&str> = file.variables().unwrap().iter().map(|v| v.name()).collect();
     assert_eq!(names, ["y", "x", "time", "Hs", "Tp", "Dir", "Te"]);
 }
+
+#[cfg(feature = "netcdf4")]
+#[test]
+fn nc4_vlen_string_attributes_with_a_fixed_string_base_are_read() {
+    // See testdata/rust_hdf5_fixtures/string_attributes.md.
+    let path = required_fixture("netcdf4", "rust_hdf5_string_attributes.nc");
+    let file = netcdf_reader::NcFile::open(&path).unwrap();
+    let text = |attrs: &[netcdf_reader::NcAttribute], name: &str| {
+        attrs
+            .iter()
+            .find(|a| a.name == name)
+            .map(|a| a.value.clone())
+            .unwrap_or_else(|| panic!("attribute {name} missing"))
+    };
+    let globals = file.global_attributes().unwrap();
+    assert_eq!(
+        text(globals, "history"),
+        netcdf_reader::NcAttrValue::Chars("edited by rust-hdf5".into())
+    );
+    let temp = file.variable("temp").unwrap();
+    assert_eq!(
+        text(temp.attributes(), "comment"),
+        netcdf_reader::NcAttrValue::Chars("written by rust-hdf5".into())
+    );
+}
