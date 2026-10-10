@@ -8,6 +8,9 @@
   v2 B-tree key is `min(heap ID length - 1, 8)` bytes, as in libhdf5, rather than
   a full-width length field, so large attributes in dense attribute storage
   (8-byte heap IDs) no longer fail with "huge fractal heap ID is too short"
+- list a group's children in link creation order when the group tracks it, as
+  libhdf5's creation-order index and netcdf-c do, instead of on-disk storage
+  order; NetCDF-4 variables now come back in netcdf-c's order
 
 ## 0.9.1 - 2026-07-28
 
