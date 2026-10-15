@@ -606,6 +606,22 @@ fn extensible_array_chunked() {
 }
 
 #[test]
+fn filtered_chunk_size_fields_of_three_bytes() {
+    // 2 KiB gzip chunks: libhdf5 writes the chunk-size field of the fixed array,
+    // extensible array and v2 B-tree entries 3 bytes wide.
+    let path = skip_if_missing!("filtered_chunk_size_3byte.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+    for name in ["/fixed", "/extensible", "/btree_v2"] {
+        let ds = file.dataset(name).unwrap();
+        assert_eq!(ds.shape(), &[32, 48], "{name}");
+        let data: ndarray::ArrayD<f64> = ds.read_array().unwrap_or_else(|e| panic!("{name}: {e}"));
+        for (i, v) in data.iter().enumerate() {
+            assert_eq!(*v, i as f64, "{name} element {i}");
+        }
+    }
+}
+
+#[test]
 fn btree_v2_chunked() {
     let path = skip_if_missing!("btree_v2_chunked.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();

@@ -287,6 +287,26 @@ def generate_hdf5_fixtures(base_dir):
         data = np.arange(40, dtype=np.float64).reshape(5, 8)
         ds[:] = data
 
+    # ---- 20b. filtered_chunk_size_3byte.h5 ----
+    # Tests: the chunk-size field of filtered chunk-index entries is sized to the
+    # chunk (1 + (log2(chunk bytes) + 8) / 8 bytes), so 256 B - 64 KiB chunks
+    # store it in 3 bytes. Fixed array, extensible array and v2 B-tree indexes,
+    # 16x16 float64 chunks (2 KiB) with gzip.
+    path = os.path.join(hdf5_dir, "filtered_chunk_size_3byte.h5")
+    print(f"  Generating {path}")
+    with h5py.File(path, "w", libver="latest") as f:
+        data = np.arange(32 * 48, dtype=np.float64).reshape(32, 48)
+        for name, maxshape in [
+            ("fixed", None),
+            ("extensible", (None, 48)),
+            ("btree_v2", (None, None)),
+        ]:
+            ds = f.create_dataset(
+                name, shape=data.shape, maxshape=maxshape, dtype=np.float64,
+                chunks=(16, 16), compression="gzip"
+            )
+            ds[:] = data
+
     # ---- 21. btree_v2_chunked.h5 ----
     # Tests: v2 B-tree chunk indexing. HDF5 uses this for chunked datasets
     # with more than one unlimited dimension when libver='latest'.
