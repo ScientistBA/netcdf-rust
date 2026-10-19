@@ -894,3 +894,25 @@ fn dense_huge_attribute_uses_short_btree_key() {
     assert_eq!(huge[0], 0.0);
     assert_eq!(huge[49_999], 49_999.0);
 }
+
+#[test]
+fn vlen_string_attributes_with_a_fixed_string_base_are_read() {
+    // rust-hdf5 records a variable-length string's base type as a one-byte fixed
+    // string; libhdf5 uses a one-byte integer. Both are strings to netcdf-c.
+    let Some(path) = fixture_path("../netcdf4/rust_hdf5_string_attributes.nc") else {
+        eprintln!("SKIPPED: fixture netcdf4/rust_hdf5_string_attributes.nc not found");
+        return;
+    };
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+    let root = file.root_group().unwrap();
+    assert_eq!(
+        root.attribute("history").unwrap().read_string().unwrap(),
+        "edited by rust-hdf5"
+    );
+    let temp = root.dataset("temp").unwrap();
+    assert_eq!(
+        temp.attribute("comment").unwrap().read_string().unwrap(),
+        "written by rust-hdf5"
+    );
+    assert_eq!(temp.attribute("units").unwrap().read_string().unwrap(), "K");
+}

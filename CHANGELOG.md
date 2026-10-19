@@ -11,6 +11,10 @@
   v2 B-tree key is `min(heap ID length - 1, 8)` bytes, as in libhdf5, rather than
   a full-width length field, so large attributes in dense attribute storage
   (8-byte heap IDs) no longer fail with "huge fractal heap ID is too short"
+- read variable-length strings whose base type is a one-byte fixed string (as
+  rust-hdf5 writes them) as well as a one-byte integer (as libhdf5 does); netcdf-c
+  treats both as NC_STRING, but attributes written by rust-hdf5 failed with
+  "unsupported NetCDF-4 datatype"
 
 ## 0.9.1 - 2026-07-28
 
