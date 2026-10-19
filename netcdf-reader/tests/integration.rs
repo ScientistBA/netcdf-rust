@@ -1206,6 +1206,17 @@ fn classic_read_variable_unified() {
 
 #[cfg(feature = "netcdf4")]
 #[test]
+fn nc4_variables_are_listed_in_creation_order() {
+    // netcdf-c numbers variables in link creation order; the fixture's compact
+    // link messages are stored in a different order (asserted by its generator).
+    let path = required_fixture("netcdf4", "creation_order_variables.nc");
+    let file = netcdf_reader::NcFile::open(&path).unwrap();
+    let names: Vec<&str> = file.variables().unwrap().iter().map(|v| v.name()).collect();
+    assert_eq!(names, ["y", "x", "time", "Hs", "Tp", "Dir", "Te"]);
+}
+
+#[cfg(feature = "netcdf4")]
+#[test]
 fn nc4_vlen_string_attributes_with_a_fixed_string_base_are_read() {
     // See testdata/rust_hdf5_fixtures/string_attributes.md.
     let path = required_fixture("netcdf4", "rust_hdf5_string_attributes.nc");

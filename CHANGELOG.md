@@ -4,6 +4,13 @@
 
 ### Fixed
 
+- list a group's children in link creation order when the group tracks it, as
+  libhdf5's creation-order index and netcdf-c do, instead of on-disk storage
+  order; NetCDF-4 variables now come back in netcdf-c's order
+- read "huge" fractal-heap objects addressed through an indirect heap ID: the
+  v2 B-tree key is `min(heap ID length - 1, 8)` bytes, as in libhdf5, rather than
+  a full-width length field, so large attributes in dense attribute storage
+  (8-byte heap IDs) no longer fail with "huge fractal heap ID is too short"
 - read variable-length strings whose base type is a one-byte fixed string (as
   rust-hdf5 writes them) as well as a one-byte integer (as libhdf5 does); netcdf-c
   treats both as NC_STRING, but attributes written by rust-hdf5 failed with

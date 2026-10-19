@@ -287,6 +287,37 @@ def generate_hdf5_fixtures(base_dir):
         data = np.arange(40, dtype=np.float64).reshape(5, 8)
         ds[:] = data
 
+    # ---- 20b. filtered_chunk_size_widths.h5 ----
+    # Tests: the chunk-size field of filtered chunk-index entries is sized to the
+    # chunk (1 + (log2(chunk bytes) + 8) / 8 bytes): 256 B - 64 KiB chunks store
+    # it in 3 bytes, 16 MiB - 4 GiB chunks in 5. Fixed array, extensible array and
+    # v2 B-tree indexes, gzip: 16x16 float64 chunks (2 KiB, 3 bytes) and
+    # 2048x1024 float64 chunks (16 MiB, 5 bytes; zeros with sparse markers
+    # r * 2048 + c at r % 1021 == 0 and c % 509 == 0, to keep the file small).
+    path = os.path.join(hdf5_dir, "filtered_chunk_size_widths.h5")
+    print(f"  Generating {path}")
+    with h5py.File(path, "w", libver="latest") as f:
+        data = np.arange(32 * 48, dtype=np.float64).reshape(32, 48)
+        large = np.zeros((4096, 2048), dtype=np.float64)
+        rows, cols = np.meshgrid(np.arange(0, 4096, 1021), np.arange(0, 2048, 509), indexing="ij")
+        large[rows, cols] = rows * 2048 + cols
+        for name, maxshape, large_maxshape in [
+            ("fixed", None, None),
+            ("extensible", (None, 48), (None, 2048)),
+            ("btree_v2", (None, None), (None, None)),
+        ]:
+            ds = f.create_dataset(
+                name, shape=data.shape, maxshape=maxshape, dtype=np.float64,
+                chunks=(16, 16), compression="gzip"
+            )
+            ds[:] = data
+            ds = f.create_dataset(
+                name + "_16mib", shape=large.shape, maxshape=large_maxshape,
+                dtype=np.float64, chunks=(2048, 1024), compression="gzip",
+                compression_opts=9
+            )
+            ds[:] = large
+
     # ---- 21. btree_v2_chunked.h5 ----
     # Tests: v2 B-tree chunk indexing. HDF5 uses this for chunked datasets
     # with more than one unlimited dimension when libver='latest'.
@@ -357,6 +388,19 @@ def generate_hdf5_fixtures(base_dir):
 
         data_i32 = np.arange(15, dtype=np.int32).reshape(3, 5)
         f.create_dataset("int32_be", data=data_i32, dtype=be_i32)
+
+
+    # ---- 23. dense_huge_attribute.h5 ----
+    # Tests: a "huge" fractal-heap object in dense attribute storage. Attribute heaps use
+    # 8-byte heap IDs, too short to hold the address and length directly, so libhdf5
+    # stores a 7-byte B-tree key (min(id_len - 1, sizeof(hsize_t))) after the flag byte.
+    path = os.path.join(hdf5_dir, "dense_huge_attribute.h5")
+    print(f"  Generating {path}")
+    with h5py.File(path, "w", libver="latest") as f:
+        ds = f.create_dataset("data", data=np.arange(4, dtype=np.int32))
+        for i in range(12):
+            ds.attrs[f"small_{i:02d}"] = np.int32(i)
+        ds.attrs["huge"] = np.arange(50_000, dtype=np.float32)
 
 
 def generate_netcdf3_fixtures(base_dir):
@@ -861,6 +905,36 @@ def generate_netcdf4_fixtures(base_dir):
     t.long_name = "temperature"
     t[:] = 280.0
     ds.close()
+
+    # ---- 14. creation_order_variables.nc ----
+    # Tests: variables listed in creation order, as netcdf-c numbers them. libhdf5
+    # stores compact link messages wherever the root header has room, so on disk
+    # their order differs from creation order; a reader that lists storage order
+    # reorders the variables. The generator asserts that the two orders differ.
+    path = os.path.join(nc4_dir, "creation_order_variables.nc")
+    print(f"  Generating {path}")
+    ds = netCDF4.Dataset(path, "w", format="NETCDF4")
+    ds.createDimension("y", 3)
+    ds.createDimension("x", 4)
+    ds.createDimension("time", 2)
+    ds.createVariable("y", "f4", ("y",))[:] = [40.0, 41.0, 42.0]
+    ds.createVariable("x", "f4", ("x",))[:] = [26.0, 27.0, 28.0, 29.0]
+    ds.createVariable("time", "f8", ("time",))[:] = [0.0, 3600.0]
+    for name in ["Hs", "Tp", "Dir", "Te"]:
+        ds.createVariable(name, "f4", ("y", "x", "time"))[:] = 1.0
+    ds.close()
+    import h5py
+
+    def _link_order(index, order):
+        names = []
+        with h5py.File(path, "r") as f:
+            f.id.links.iterate(lambda n: names.append(n.decode()), idx_type=index, order=order)
+        return names
+
+    created = _link_order(h5py.h5.INDEX_CRT_ORDER, h5py.h5.ITER_INC)
+    stored = _link_order(h5py.h5.INDEX_NAME, h5py.h5.ITER_NATIVE)
+    assert created == ["y", "x", "time", "Hs", "Tp", "Dir", "Te"], created
+    assert stored != created, "fixture no longer exercises storage != creation order"
 
 
 SECTION_GENERATORS = {
