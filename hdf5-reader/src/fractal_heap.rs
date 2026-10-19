@@ -757,10 +757,10 @@ impl FractalHeap {
             });
         }
 
-        // Indirect huge IDs hold a B-tree key of min(id_len - 1, sizeof(hsize_t))
-        // bytes after the flag byte (libhdf5 H5HF__huge_init), not a full-width
-        // length field: attribute heaps use 8-byte IDs, i.e. a 7-byte key.
-        if heap_id.len() < 2 {
+        // HDF5 (H5HFhuge.c) keys an indirect huge object by
+        // min(id_len - 1, sizeof(hsize_t)) bytes.
+        let key_len = (heap_id.len().saturating_sub(1)).min(8);
+        if key_len == 0 {
             return Err(Error::InvalidData(
                 "huge fractal heap ID is too short".into(),
             ));
@@ -769,9 +769,8 @@ impl FractalHeap {
             return Err(Error::UndefinedAddress);
         }
 
-        let key_size = (heap_id.len() - 1).min(std::mem::size_of::<u64>());
         let mut key_cursor = Cursor::new(&heap_id[1..]);
-        let object_id = key_cursor.read_uvar(key_size)?;
+        let object_id = key_cursor.read_uvar(key_len)?;
 
         let header = if let Some(storage) = storage {
             crate::btree_v2::BTreeV2Header::parse_at_storage(
