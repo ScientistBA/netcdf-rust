@@ -253,9 +253,9 @@ fn strings(dir: &Path) -> Value {
 }
 
 /// Resizable (unlimited max dims) chunked datasets, unfiltered and filtered.
-/// libhdf5 requires a real chunk index (not implicit) for these.
 fn resizable(dir: &Path) -> Value {
     let values: Vec<i32> = (0..12).collect();
+    let many: Vec<i32> = (0..5000).collect();
     let builder = Hdf5Builder::new()
         .dataset(
             DatasetBuilder::typed_data("growing", vec![2, 6], &values)
@@ -269,6 +269,14 @@ fn resizable(dir: &Path) -> Value {
                 .chunked(vec![1, 6])
                 .max_shape(vec![UNLIMITED, 6])
                 .filter(deflate(5)),
+        )
+        .dataset(
+            // 5000 chunks overflow a 64-entry B-tree node: a three-level tree.
+            DatasetBuilder::typed_data("many_chunks", vec![5000], &many)
+                .unwrap()
+                .chunked(vec![1])
+                .max_shape(vec![UNLIMITED])
+                .filter(deflate(1)),
         );
 
     write_file(dir, "resizable.h5", builder);
@@ -286,6 +294,12 @@ fn resizable(dir: &Path) -> Value {
                 "layout": "chunked", "chunks": [1, 6],
                 "filters": {"deflate": 5, "shuffle": false, "fletcher32": false},
                 "values": expected
+            },
+            {
+                "name": "many_chunks", "dtype": "i4", "shape": [5000], "maxshape": [null],
+                "layout": "chunked", "chunks": [1],
+                "filters": {"deflate": 1, "shuffle": false, "fletcher32": false},
+                "values": many
             }
         ]
     })

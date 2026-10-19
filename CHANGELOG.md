@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- write every chunked HDF5/NetCDF-4 variable with a version-3 layout and a v1
+  B-tree chunk index, as netcdf-c does, instead of the v4 layout's implicit,
+  single-chunk, fixed-array, and v2 B-tree indexes, which netcdf-java (and so
+  Panoply) fails to read (#88)
 - list a group's children in link creation order when the group tracks it, as
   libhdf5's creation-order index and netcdf-c do, instead of on-disk storage
   order; NetCDF-4 variables now come back in netcdf-c's order
