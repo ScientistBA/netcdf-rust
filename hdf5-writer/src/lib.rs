@@ -19,9 +19,8 @@
 //! assert_eq!(&bytes[..8], b"\x89HDF\r\n\x1a\n");
 //! ```
 //!
-//! Supported: superblock v2; contiguous, compact, and chunked layouts (implicit,
-//! single-chunk, fixed-array, and version-2 B-tree indices, the last for
-//! unlimited maximum dimensions); groups; attributes; the deflate, shuffle, and
+//! Supported: superblock v2; contiguous, compact, and chunked layouts (chunks
+//! indexed by a version-1 B-tree, as netcdf-c writes them); groups; attributes; the deflate, shuffle, and
 //! fletcher32 filters; and fixed-point, floating-point, string (fixed and
 //! variable-length), reference, variable-length, bitfield, opaque, compound,
 //! enum, and array datatypes. Output is validated against libhdf5.
@@ -1154,7 +1153,7 @@ struct DatasetEmission<'a> {
     header_address: u64,
     data_address: u64,
     header: Vec<u8>,
-    chunk_index: Option<FixedArrayChunkIndexEmission>,
+    chunk_index: Option<ChunkIndexEmission>,
 }
 
 #[derive(Debug)]
@@ -1163,12 +1162,12 @@ struct GroupEmission {
     header: Vec<u8>,
 }
 
+/// Every node of a dataset's v1 B-tree chunk index, written contiguously with
+/// the root node first (at `address`).
 #[derive(Debug)]
-struct FixedArrayChunkIndexEmission {
-    header_address: u64,
-    data_block_address: u64,
-    header: Vec<u8>,
-    data_block: Vec<u8>,
+struct ChunkIndexEmission {
+    address: u64,
+    nodes: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -1334,27 +1333,14 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
     let mut chunk_index_addresses = Vec::with_capacity(prepared.len());
     for prepared_dataset in &prepared {
         if let Some(chunk_index) = &prepared_dataset.chunk_index {
-            // Block sizes are address-invariant, so a single sizing pass fixes
-            // the header and secondary-block addresses.
-            let (header_len, data_block_len) = chunk_index_block_sizes(chunk_index)?;
-            let header_address = next_address;
+            // The index size depends only on the chunk count and rank, so it
+            // can be placed before the (address-sensitive) chunk data.
+            let index_len = btree_v1_chunk_index_size(chunk_index)?;
+            chunk_index_addresses.push(Some(next_address));
             next_address = align_u64(
-                checked_add_u64(next_address, header_len as u64, "chunk index header end")?,
+                checked_add_u64(next_address, index_len, "chunk index end")?,
                 8,
             );
-            let data_block_address = next_address;
-            next_address = align_u64(
-                checked_add_u64(
-                    next_address,
-                    data_block_len as u64,
-                    "chunk index secondary block end",
-                )?,
-                8,
-            );
-            chunk_index_addresses.push(Some(FixedArrayChunkIndexAddresses {
-                header: header_address,
-                data_block: data_block_address,
-            }));
         } else {
             chunk_index_addresses.push(None);
         }
@@ -1421,23 +1407,17 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
             .zip(data_addresses.iter().copied())
             .zip(chunk_index_addresses.iter().copied())
     {
-        let layout_address = chunk_index_address.map_or(data_address, |address| address.header);
+        // A chunked dataset's layout message points at its B-tree root, which
+        // is the first node written at the index address.
+        let layout_address = chunk_index_address.unwrap_or(data_address);
         let header =
             encode_dataset_header(&prepared_dataset, attributes, layout_address, heap_address)?;
-        let chunk_index = if let (Some(chunk_index), Some(addresses)) =
+        let chunk_index = if let (Some(chunk_index), Some(address)) =
             (&prepared_dataset.chunk_index, chunk_index_address)
         {
-            let (header, data_block) = encode_chunk_index_blocks(
-                chunk_index,
-                addresses.header,
-                addresses.data_block,
-                data_address,
-            )?;
-            Some(FixedArrayChunkIndexEmission {
-                header_address: addresses.header,
-                data_block_address: addresses.data_block,
-                header,
-                data_block,
+            Some(ChunkIndexEmission {
+                address,
+                nodes: encode_btree_v1_chunk_index(chunk_index, address, data_address)?,
             })
         } else {
             None
@@ -1469,10 +1449,8 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
 
     for emission in &emissions {
         if let Some(chunk_index) = &emission.chunk_index {
-            pad_to_address(&mut file, chunk_index.header_address)?;
-            file.extend_from_slice(&chunk_index.header);
-            pad_to_address(&mut file, chunk_index.data_block_address)?;
-            file.extend_from_slice(&chunk_index.data_block);
+            pad_to_address(&mut file, chunk_index.address)?;
+            file.extend_from_slice(&chunk_index.nodes);
         }
     }
 
@@ -1501,32 +1479,29 @@ struct PreparedDataset<'a> {
     chunk_index: Option<PreparedChunkIndex>,
 }
 
-/// On-disk index structure used to locate a chunked dataset's chunks.
+/// The chunks of a chunked dataset, indexed on disk by a version-1 B-tree.
 ///
-/// Datasets with unlimited maximum dimensions require a version-2 B-tree index
-/// (the fixed array and implicit indices are only valid for fixed max dims);
-/// everything else with a resolvable chunk index uses the fixed array.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChunkIndexKind {
-    FixedArray,
-    BtreeV2,
-}
-
+/// Every chunked dataset uses a version-3 layout message with a v1 B-tree
+/// index, whatever its filters or maximum dimensions. That is the encoding
+/// netcdf-c and libhdf5 produce at their default format bounds, and the one
+/// every HDF5 reader supports; the v4 layout's newer indexes (implicit,
+/// single chunk, fixed array, v2 B-tree) are not, e.g. netcdf-java misreads
+/// them.
 #[derive(Debug)]
 struct PreparedChunkIndex {
-    kind: ChunkIndexKind,
+    /// Chunk dimensions in elements, one per dataset dimension.
+    chunk_shape: Vec<u64>,
+    /// Chunks in row-major grid order, which is the B-tree key order.
     chunks: Vec<PreparedChunkIndexEntry>,
-    /// Byte width of the encoded chunk-size field in each entry.
-    chunk_size_len: u8,
 }
 
 #[derive(Debug)]
 struct PreparedChunkIndexEntry {
     relative_address: u64,
-    size: u64,
+    /// Stored (post-filter) chunk byte length.
+    size: u32,
     filter_mask: u32,
-    /// Chunk grid coordinates (one per dataset dimension); the B-tree index
-    /// records these as scaled offsets.
+    /// Chunk grid coordinates (one per dataset dimension).
     scaled_offsets: Vec<u64>,
 }
 
@@ -1535,12 +1510,6 @@ struct DataHeapLayout {
     data_addresses: Vec<u64>,
     heap_address: u64,
     eof_address: u64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct FixedArrayChunkIndexAddresses {
-    header: u64,
-    data_block: u64,
 }
 
 fn prepare_datasets(
@@ -1589,7 +1558,6 @@ fn prepare_datasets(
                 &dataset.layout,
                 &filters,
                 element_size,
-                dataset.max_shape.as_deref(),
             )?
         } else if let Some(values) = &dataset.vlen_sequence_values {
             if dataset.fill_value.is_some() {
@@ -1632,7 +1600,6 @@ fn prepare_datasets(
                 &dataset.layout,
                 &filters,
                 element_size,
-                dataset.max_shape.as_deref(),
             )?
         } else if let Some(raw_data) = dataset.raw_data.as_deref() {
             if raw_data.len() != expected {
@@ -1648,7 +1615,6 @@ fn prepare_datasets(
                 &dataset.layout,
                 &filters,
                 element_size,
-                dataset.max_shape.as_deref(),
             )?
         } else if dataset.fill_value.is_some() {
             if matches!(dataset.layout, PlannedLayout::Compact) {
@@ -1688,47 +1654,16 @@ fn prepare_raw_dataset_storage(
     layout: &PlannedLayout,
     filters: &[FilterDescription],
     element_size: usize,
-    max_shape: Option<&[u64]>,
 ) -> Result<(Vec<u8>, Option<PreparedChunkIndex>)> {
-    let unlimited = has_unlimited_max_shape(max_shape);
     match layout {
         PlannedLayout::Contiguous | PlannedLayout::Compact => Ok((raw_data.to_vec(), None)),
         PlannedLayout::Chunked { chunk_shape } => {
             if filters.is_empty() {
                 let storage = chunked_storage_data(raw_data, shape, chunk_shape, element_size)?;
-                // Fixed max dims use the compact implicit index; unlimited dims
-                // require a real (B-tree v2) index.
-                let index = if unlimited {
-                    unfiltered_btree_chunk_index(shape, chunk_shape, element_size)?
-                } else {
-                    None
-                };
+                let index = unfiltered_chunk_index(shape, chunk_shape, element_size)?;
                 Ok((storage, index))
-            } else if chunk_count(shape, chunk_shape)? <= 1 && !unlimited {
-                let storage_data =
-                    chunked_storage_data(raw_data, shape, chunk_shape, element_size)?;
-                if storage_data.is_empty() {
-                    Ok((storage_data, None))
-                } else {
-                    Ok((
-                        apply_write_filters(&storage_data, filters, element_size)?,
-                        None,
-                    ))
-                }
             } else {
-                let kind = if unlimited {
-                    ChunkIndexKind::BtreeV2
-                } else {
-                    ChunkIndexKind::FixedArray
-                };
-                filtered_chunk_storage_data(
-                    raw_data,
-                    shape,
-                    chunk_shape,
-                    element_size,
-                    filters,
-                    kind,
-                )
+                filtered_chunk_storage_data(raw_data, shape, chunk_shape, element_size, filters)
             }
         }
     }
@@ -2001,112 +1936,180 @@ fn resolve_planned_links(
         .collect()
 }
 
-#[derive(Debug)]
-struct FixedArrayChunkEntry {
-    address: u64,
-    size: u64,
-    filter_mask: u32,
-    scaled_offsets: Vec<u64>,
+/// Children per v1 B-tree chunk-index node (2K, where K is the indexed-storage
+/// rank). Superblock v2 files carry no K, so readers use libhdf5's default of
+/// 32.
+const BTREE_V1_CHUNK_NODE_CAPACITY: usize = 64;
+/// Node header: signature, node type, level, entries used, sibling addresses.
+const BTREE_V1_NODE_HEADER_SIZE: u64 = 4 + 1 + 1 + 2 + 2 * OFFSET_SIZE as u64;
+const BTREE_V1_RAW_DATA_NODE_TYPE: u8 = 1;
+
+/// Byte size of one raw-data chunk key: chunk size, filter mask, and an
+/// element offset per dataset dimension plus the trailing element-size one.
+fn btree_v1_chunk_key_size(rank: usize) -> Result<u64> {
+    let offsets = checked_mul_u64(rank as u64 + 1, 8, "v1 B-tree chunk key size")?;
+    checked_add_u64(4 + 4, offsets, "v1 B-tree chunk key size")
 }
 
-fn fixed_array_entries(
+/// On-disk size of one chunk-index node. Readers load a node at its full
+/// capacity (2K children, 2K + 1 keys) whatever its entries-used count, so
+/// every node is written at this size.
+fn btree_v1_chunk_node_size(rank: usize) -> Result<u64> {
+    let capacity = BTREE_V1_CHUNK_NODE_CAPACITY as u64;
+    let children = capacity * u64::from(OFFSET_SIZE);
+    let keys = checked_mul_u64(
+        capacity + 1,
+        btree_v1_chunk_key_size(rank)?,
+        "v1 B-tree node size",
+    )?;
+    checked_add_u64(
+        BTREE_V1_NODE_HEADER_SIZE + children,
+        keys,
+        "v1 B-tree node size",
+    )
+}
+
+/// Node count of each tree level, root level first.
+fn btree_v1_level_widths(num_chunks: usize) -> Vec<usize> {
+    let mut widths = vec![num_chunks.div_ceil(BTREE_V1_CHUNK_NODE_CAPACITY).max(1)];
+    while widths[0] > 1 {
+        widths.insert(0, widths[0].div_ceil(BTREE_V1_CHUNK_NODE_CAPACITY));
+    }
+    widths
+}
+
+/// Byte length of a chunk index's B-tree. It depends only on the chunk count
+/// and rank, never on addresses.
+fn btree_v1_chunk_index_size(chunk_index: &PreparedChunkIndex) -> Result<u64> {
+    let nodes: usize = btree_v1_level_widths(chunk_index.chunks.len()).iter().sum();
+    checked_mul_u64(
+        nodes as u64,
+        btree_v1_chunk_node_size(chunk_index.chunk_shape.len())?,
+        "v1 B-tree chunk index size",
+    )
+}
+
+/// Encode a raw-data chunk key. Offsets are in elements; the trailing
+/// element-size dimension's offset is always 0.
+fn encode_btree_v1_chunk_key(
+    size: u32,
+    filter_mask: u32,
+    scaled_offsets: &[u64],
+    chunk_shape: &[u64],
+) -> Result<Vec<u8>> {
+    let mut key = Vec::with_capacity(checked_usize(
+        btree_v1_chunk_key_size(chunk_shape.len())?,
+        "v1 B-tree chunk key size",
+    )?);
+    key.extend_from_slice(&size.to_le_bytes());
+    key.extend_from_slice(&filter_mask.to_le_bytes());
+    for (&scaled, &chunk_dim) in scaled_offsets.iter().zip(chunk_shape) {
+        let offset = checked_mul_u64(scaled, chunk_dim, "v1 B-tree chunk key offset")?;
+        key.extend_from_slice(&offset.to_le_bytes());
+    }
+    key.extend_from_slice(&0u64.to_le_bytes());
+    Ok(key)
+}
+
+/// Encode every node of a chunk index's v1 B-tree, root first, for a tree
+/// written at `index_address` over chunk data starting at `data_address`.
+///
+/// Levels are laid out top-down and each level's nodes left to right. Every
+/// node's key `i` is the first key of child `i`; its final key bounds the
+/// subtree from above, and for the last chunk is that chunk's grid position
+/// plus one in every dimension, as libhdf5 writes it.
+fn encode_btree_v1_chunk_index(
     chunk_index: &PreparedChunkIndex,
+    index_address: u64,
     data_address: u64,
-) -> Result<Vec<FixedArrayChunkEntry>> {
-    chunk_index
+) -> Result<Vec<u8>> {
+    let chunk_shape = &chunk_index.chunk_shape;
+    let last = chunk_index.chunks.last().ok_or_else(|| {
+        Error::InvalidDefinition("v1 B-tree chunk index requires at least one chunk".into())
+    })?;
+    let upper_bound = last
+        .scaled_offsets
+        .iter()
+        .map(|&scaled| checked_add_u64(scaled, 1, "v1 B-tree chunk bound"))
+        .collect::<Result<Vec<_>>>()?;
+    let closing_key = encode_btree_v1_chunk_key(0, 0, &upper_bound, chunk_shape)?;
+
+    // (first key, address) of each child of the level being built.
+    let mut children = chunk_index
         .chunks
         .iter()
         .map(|chunk| {
-            Ok(FixedArrayChunkEntry {
-                address: checked_add_u64(
-                    data_address,
-                    chunk.relative_address,
-                    "fixed array chunk address",
-                )?,
-                size: chunk.size,
-                filter_mask: chunk.filter_mask,
-                scaled_offsets: chunk.scaled_offsets.clone(),
-            })
-        })
-        .collect()
-}
-
-fn fixed_array_entry_count(chunk_index: &PreparedChunkIndex) -> Result<u64> {
-    u64::try_from(chunk_index.chunks.len()).map_err(|_| {
-        Error::InvalidDefinition("fixed array chunk entry count exceeds u64 capacity".into())
-    })
-}
-
-/// Byte lengths of a chunk index's two on-disk blocks (header, secondary),
-/// computed without needing final addresses — used to lay out the file.
-fn chunk_index_block_sizes(chunk_index: &PreparedChunkIndex) -> Result<(usize, usize)> {
-    let (header, data_block) = encode_chunk_index_blocks(chunk_index, 0, 0, 0)?;
-    Ok((header.len(), data_block.len()))
-}
-
-/// Encode a chunk index's header and secondary block for the given addresses.
-/// The header goes at `header_address`, the secondary block (fixed-array data
-/// block or B-tree leaf) at `data_block_address`, and chunk data starts at
-/// `data_address`.
-fn encode_chunk_index_blocks(
-    chunk_index: &PreparedChunkIndex,
-    header_address: u64,
-    data_block_address: u64,
-    data_address: u64,
-) -> Result<(Vec<u8>, Vec<u8>)> {
-    let entries = fixed_array_entries(chunk_index, data_address)?;
-    let count = fixed_array_entry_count(chunk_index)?;
-    match chunk_index.kind {
-        ChunkIndexKind::FixedArray => Ok((
-            encode_fixed_array_chunk_index_header(
-                count,
-                chunk_index.chunk_size_len,
-                data_block_address,
-            )?,
-            encode_fixed_array_chunk_index_data_block(
-                header_address,
-                &entries,
-                chunk_index.chunk_size_len,
-            )?,
-        )),
-        ChunkIndexKind::BtreeV2 => {
-            let (record_type, record_size, node_size) = btree_v2_index_params(chunk_index)?;
             Ok((
-                encode_btree_v2_header(
-                    record_type,
-                    record_size,
-                    node_size,
-                    data_block_address,
-                    count,
+                encode_btree_v1_chunk_key(
+                    chunk.size,
+                    chunk.filter_mask,
+                    &chunk.scaled_offsets,
+                    chunk_shape,
                 )?,
-                encode_btree_v2_leaf(
-                    record_type,
-                    record_size,
-                    node_size,
-                    &entries,
-                    chunk_index.chunk_size_len,
-                )?,
+                checked_add_u64(data_address, chunk.relative_address, "chunk address")?,
             ))
-        }
-    }
-}
+        })
+        .collect::<Result<Vec<_>>>()?;
 
-/// Record type, record size, and single-leaf node size for a v2 B-tree chunk
-/// index.
-fn btree_v2_index_params(chunk_index: &PreparedChunkIndex) -> Result<(u8, u16, u32)> {
-    let filtered = chunk_index.chunk_size_len > 0;
-    let record_type = if filtered {
-        BTREE_V2_RECORD_TYPE_FILTERED
-    } else {
-        BTREE_V2_RECORD_TYPE_UNFILTERED
+    let node_size = btree_v1_chunk_node_size(chunk_shape.len())?;
+    let node_len = checked_usize(node_size, "v1 B-tree node size")?;
+    let widths = btree_v1_level_widths(children.len());
+    let total_nodes: usize = widths.iter().sum();
+    let mut nodes = vec![0u8; checked_mul_usize(total_nodes, node_len, "v1 B-tree size")?];
+    let node_address = |index: usize| -> Result<u64> {
+        checked_add_u64(
+            index_address,
+            checked_mul_u64(index as u64, node_size, "v1 B-tree node offset")?,
+            "v1 B-tree node address",
+        )
     };
-    let ndims = chunk_index
-        .chunks
-        .first()
-        .map_or(0, |chunk| chunk.scaled_offsets.len());
-    let record_size = btree_v2_record_size(ndims, chunk_index.chunk_size_len, filtered)?;
-    let node_size = btree_v2_node_size(fixed_array_entry_count(chunk_index)?, record_size)?;
-    Ok((record_type, record_size, node_size))
+
+    // Build leaves first: each level's keys come from the level below.
+    let mut level_start = total_nodes;
+    for (level, &width) in widths.iter().rev().enumerate() {
+        level_start -= width;
+        let level = u8::try_from(level)
+            .map_err(|_| Error::InvalidDefinition("v1 B-tree depth exceeds u8".into()))?;
+        let mut parents = Vec::with_capacity(width);
+        for (position, group) in children.chunks(BTREE_V1_CHUNK_NODE_CAPACITY).enumerate() {
+            let index = level_start + position;
+            let left_sibling = if position == 0 {
+                UNDEFINED_ADDRESS
+            } else {
+                node_address(index - 1)?
+            };
+            let right_sibling = if position + 1 == width {
+                UNDEFINED_ADDRESS
+            } else {
+                node_address(index + 1)?
+            };
+            let upper_key = children
+                .get((position + 1) * BTREE_V1_CHUNK_NODE_CAPACITY)
+                .map_or(&closing_key, |(key, _)| key);
+
+            let node = &mut nodes[index * node_len..(index + 1) * node_len];
+            let mut cursor = 0;
+            let mut put = |bytes: &[u8]| {
+                node[cursor..cursor + bytes.len()].copy_from_slice(bytes);
+                cursor += bytes.len();
+            };
+            put(b"TREE");
+            put(&[BTREE_V1_RAW_DATA_NODE_TYPE, level]);
+            put(&(group.len() as u16).to_le_bytes());
+            put(&left_sibling.to_le_bytes());
+            put(&right_sibling.to_le_bytes());
+            for (key, address) in group {
+                put(key);
+                put(&address.to_le_bytes());
+            }
+            put(upper_key);
+
+            parents.push((group[0].0.clone(), node_address(index)?));
+        }
+        debug_assert_eq!(parents.len(), width);
+        children = parents;
+    }
+    Ok(nodes)
 }
 
 fn plan_attributes(
@@ -2410,7 +2413,6 @@ fn dataset_vlen_storage_data(
         &dataset.layout,
         filters,
         element_size,
-        dataset.max_shape.as_deref(),
     )
 }
 
@@ -2584,69 +2586,29 @@ fn encode_data_layout_message(dataset: &PreparedDataset<'_>, data_address: u64) 
             dataset.data_size,
         )),
         PlannedLayout::Chunked { chunk_shape } => {
-            let element_size = chunk_element_size(&dataset.dataset.datatype)?;
-            if let Some(chunk_index) = &dataset.chunk_index {
-                match chunk_index.kind {
-                    ChunkIndexKind::FixedArray => {
-                        let page_bits =
-                            fixed_array_page_bits(fixed_array_entry_count(chunk_index)?)?;
-                        encode_fixed_array_chunked_layout_message(
-                            storage_address,
-                            chunk_shape,
-                            element_size,
-                            page_bits,
-                        )
-                    }
-                    ChunkIndexKind::BtreeV2 => {
-                        let (_, _, node_size) = btree_v2_index_params(chunk_index)?;
-                        encode_btree_v2_chunked_layout_message(
-                            storage_address,
-                            chunk_shape,
-                            element_size,
-                            node_size,
-                        )
-                    }
-                }
-            } else if dataset.filters.is_empty() {
-                // Fixed max dims, unfiltered: the compact implicit index.
-                encode_implicit_chunked_layout_message(storage_address, chunk_shape, element_size)
+            // No chunks (an empty or fill-only dataset) means no B-tree.
+            let btree_address = if dataset.chunk_index.is_some() {
+                data_address
             } else {
-                // Fixed max dims, filtered, single chunk.
-                encode_single_chunk_layout_message(
-                    storage_address,
-                    chunk_shape,
-                    dataset.data_size,
-                    element_size,
-                )
-            }
+                UNDEFINED_ADDRESS
+            };
+            encode_chunked_layout_message(
+                btree_address,
+                chunk_shape,
+                chunk_element_size(&dataset.dataset.datatype)?,
+            )
         }
         PlannedLayout::Compact => encode_compact_layout_message(&dataset.raw_data),
     }
 }
 
 /// Byte width of one dataset element as stored in chunked data, appended as
-/// the trailing chunk dimension in v3/v4 layout messages.
+/// the trailing chunk dimension in the chunked layout message.
 fn chunk_element_size(datatype: &Datatype) -> Result<u32> {
     let size = datatype_element_size(datatype)?;
     u32::try_from(size).map_err(|_| {
         Error::UnsupportedFeature("chunked element size exceeds layout message capacity".into())
     })
-}
-
-/// Fixed-array data-block page size (log2). Readers reject 0, and any entry
-/// count above one page would require the paged data-block format the writer
-/// does not emit, so size the page to hold every entry.
-fn fixed_array_page_bits(num_entries: u64) -> Result<u8> {
-    let mut bits = 10u8;
-    while (1u64 << bits) < num_entries {
-        bits += 1;
-        if bits > 25 {
-            return Err(Error::UnsupportedFeature(
-                "fixed array chunk count exceeds the single-page data block limit".into(),
-            ));
-        }
-    }
-    Ok(bits)
 }
 
 fn encode_attribute_header_messages(
@@ -3054,6 +3016,31 @@ fn encode_contiguous_layout_message(address: u64, size: u64) -> Vec<u8> {
     bytes
 }
 
+/// Version-3 chunked layout: the v1 B-tree root address, then the chunk
+/// dimensions as 4-byte values with the element size as the trailing one.
+fn encode_chunked_layout_message(
+    btree_address: u64,
+    chunk_shape: &[u64],
+    element_size: u32,
+) -> Result<Vec<u8>> {
+    let ndims = u8::try_from(chunk_shape.len() + 1).map_err(|_| {
+        Error::InvalidDefinition("chunked dataset rank exceeds HDF5 rank field capacity".into())
+    })?;
+    let mut bytes = Vec::with_capacity(3 + usize::from(OFFSET_SIZE) + usize::from(ndims) * 4);
+    bytes.push(3);
+    bytes.push(2);
+    bytes.push(ndims);
+    bytes.extend_from_slice(&btree_address.to_le_bytes());
+    for &dim in chunk_shape {
+        let dim = u32::try_from(dim).map_err(|_| {
+            Error::InvalidDefinition("chunk dimension exceeds HDF5 layout message capacity".into())
+        })?;
+        bytes.extend_from_slice(&dim.to_le_bytes());
+    }
+    bytes.extend_from_slice(&element_size.to_le_bytes());
+    Ok(bytes)
+}
+
 fn encode_compact_layout_message(data: &[u8]) -> Result<Vec<u8>> {
     let size = u16::try_from(data.len()).map_err(|_| {
         Error::UnsupportedFeature(
@@ -3077,20 +3064,13 @@ const FILL_WRITE_TIME_IFSET: u8 = 2 << 2;
 /// Flag bit 5: the message carries a defined fill value (size + data).
 const FILL_VALUE_DEFINED: u8 = 0x20;
 
-/// When the file's data for each layout is allocated. Implicit chunk indexes
-/// require early allocation (the writer materializes every chunk up front);
-/// libhdf5 pairs the other layouts with these defaults.
+/// When the file's data for each layout is allocated: libhdf5's default for
+/// each layout.
 fn space_allocation_time(dataset: &PreparedDataset<'_>) -> u8 {
     match &dataset.dataset.layout {
         PlannedLayout::Compact => ALLOC_TIME_EARLY,
         PlannedLayout::Contiguous => ALLOC_TIME_LATE,
-        PlannedLayout::Chunked { .. } => {
-            if dataset.filters.is_empty() {
-                ALLOC_TIME_EARLY
-            } else {
-                ALLOC_TIME_INCREMENTAL
-            }
-        }
+        PlannedLayout::Chunked { .. } => ALLOC_TIME_INCREMENTAL,
     }
 }
 
@@ -3149,293 +3129,6 @@ fn encode_filter_pipeline_message(filters: &[FilterDescription]) -> Result<Vec<u
             bytes.extend_from_slice(&value.to_le_bytes());
         }
     }
-    Ok(bytes)
-}
-
-/// Flag bit 1 of a v4 chunked layout: the single-chunk index carries the
-/// filtered chunk size and filter mask inline.
-const V4_LAYOUT_SINGLE_INDEX_WITH_FILTER: u8 = 0x02;
-
-fn encode_single_chunk_layout_message(
-    address: u64,
-    chunk_shape: &[u64],
-    filtered_size: u64,
-    element_size: u32,
-) -> Result<Vec<u8>> {
-    let mut bytes = Vec::with_capacity(22 + chunk_shape.len() * 4 + usize::from(OFFSET_SIZE));
-    encode_v4_chunked_layout_preamble(
-        &mut bytes,
-        V4_LAYOUT_SINGLE_INDEX_WITH_FILTER,
-        chunk_shape,
-        element_size,
-    )?;
-    bytes.push(1);
-    bytes.extend_from_slice(&filtered_size.to_le_bytes());
-    bytes.extend_from_slice(&0u32.to_le_bytes());
-    bytes.extend_from_slice(&address.to_le_bytes());
-    Ok(bytes)
-}
-
-/// Write the v4 chunked layout preamble: version, class, flags, rank, and the
-/// chunk dimensions with the element size appended as the trailing dimension
-/// (readers validate that dimension against the datatype size).
-///
-/// Dimensions use the minimal byte width for the largest value; readers
-/// recompute that width from the decoded dimensions and reject a mismatch.
-fn encode_v4_chunked_layout_preamble(
-    bytes: &mut Vec<u8>,
-    flags: u8,
-    chunk_shape: &[u64],
-    element_size: u32,
-) -> Result<()> {
-    if chunk_shape.len() + 1 > u8::MAX as usize {
-        return Err(Error::InvalidDefinition(
-            "chunked dataset rank exceeds HDF5 rank field capacity".into(),
-        ));
-    }
-    let max_dim = chunk_shape
-        .iter()
-        .copied()
-        .chain(std::iter::once(u64::from(element_size)))
-        .max()
-        .unwrap_or(1);
-    let dim_bytes = minimal_uint_width(max_dim);
-    bytes.push(4);
-    bytes.push(2);
-    bytes.push(flags);
-    bytes.push((chunk_shape.len() + 1) as u8);
-    bytes.push(dim_bytes);
-    for &dim in chunk_shape {
-        write_uvar(dim, usize::from(dim_bytes), bytes);
-    }
-    write_uvar(u64::from(element_size), usize::from(dim_bytes), bytes);
-    Ok(())
-}
-
-/// Minimal number of bytes needed to encode `value` (at least 1).
-fn minimal_uint_width(value: u64) -> u8 {
-    let bits = 64 - value.leading_zeros();
-    (bits.max(1)).div_ceil(8) as u8
-}
-
-fn encode_implicit_chunked_layout_message(
-    address: u64,
-    chunk_shape: &[u64],
-    element_size: u32,
-) -> Result<Vec<u8>> {
-    let mut bytes = Vec::with_capacity(10 + chunk_shape.len() * 4 + usize::from(OFFSET_SIZE));
-    encode_v4_chunked_layout_preamble(&mut bytes, 0, chunk_shape, element_size)?;
-    bytes.push(2);
-    bytes.extend_from_slice(&address.to_le_bytes());
-    Ok(bytes)
-}
-
-fn encode_fixed_array_chunked_layout_message(
-    address: u64,
-    chunk_shape: &[u64],
-    element_size: u32,
-    page_bits: u8,
-) -> Result<Vec<u8>> {
-    let mut bytes = Vec::with_capacity(11 + chunk_shape.len() * 4 + usize::from(OFFSET_SIZE));
-    encode_v4_chunked_layout_preamble(&mut bytes, 0, chunk_shape, element_size)?;
-    bytes.push(3);
-    bytes.push(page_bits);
-    bytes.extend_from_slice(&address.to_le_bytes());
-    Ok(bytes)
-}
-
-/// v2 B-tree chunk-index node parameters. `split`/`merge` percentages match
-/// libhdf5's defaults; readers ignore them for a depth-0 tree.
-const BTREE_V2_SPLIT_PERCENT: u8 = 100;
-const BTREE_V2_MERGE_PERCENT: u8 = 40;
-const BTREE_V2_LEAF_OVERHEAD: u64 = 4 + 1 + 1 + 4; // signature + version + type + checksum
-const BTREE_V2_RECORD_TYPE_UNFILTERED: u8 = 10;
-const BTREE_V2_RECORD_TYPE_FILTERED: u8 = 11;
-
-/// Byte size of one v2 B-tree chunk record.
-fn btree_v2_record_size(ndims: usize, chunk_size_len: u8, filtered: bool) -> Result<u16> {
-    let offsets = ndims
-        .checked_mul(8)
-        .ok_or_else(|| Error::InvalidDefinition("chunk offset bytes overflow".into()))?;
-    let fixed = usize::from(OFFSET_SIZE)
-        + offsets
-        + if filtered {
-            usize::from(chunk_size_len) + 4
-        } else {
-            0
-        };
-    u16::try_from(fixed)
-        .map_err(|_| Error::UnsupportedFeature("v2 B-tree chunk record exceeds u16".into()))
-}
-
-/// Single-leaf node size: exactly large enough for the leaf header, all
-/// records, and the trailing checksum, 8-byte aligned.
-fn btree_v2_node_size(num_records: u64, record_size: u16) -> Result<u32> {
-    let records_bytes = num_records
-        .checked_mul(u64::from(record_size))
-        .ok_or_else(|| Error::InvalidDefinition("v2 B-tree leaf size overflow".into()))?;
-    let size = align_u64(
-        checked_add_u64(BTREE_V2_LEAF_OVERHEAD, records_bytes, "v2 B-tree leaf size")?,
-        8,
-    );
-    u32::try_from(size)
-        .map_err(|_| Error::UnsupportedFeature("v2 B-tree node size exceeds u32".into()))
-}
-
-fn encode_btree_v2_chunked_layout_message(
-    address: u64,
-    chunk_shape: &[u64],
-    element_size: u32,
-    node_size: u32,
-) -> Result<Vec<u8>> {
-    let mut bytes = Vec::with_capacity(15 + chunk_shape.len() * 4 + usize::from(OFFSET_SIZE));
-    encode_v4_chunked_layout_preamble(&mut bytes, 0, chunk_shape, element_size)?;
-    bytes.push(5); // index type: v2 B-tree
-    bytes.extend_from_slice(&node_size.to_le_bytes());
-    bytes.push(BTREE_V2_SPLIT_PERCENT);
-    bytes.push(BTREE_V2_MERGE_PERCENT);
-    bytes.extend_from_slice(&address.to_le_bytes());
-    Ok(bytes)
-}
-
-fn encode_btree_v2_header(
-    record_type: u8,
-    record_size: u16,
-    node_size: u32,
-    root_node_address: u64,
-    num_records: u64,
-) -> Result<Vec<u8>> {
-    let mut bytes = Vec::with_capacity(4 + 1 + 1 + 4 + 2 + 2 + 1 + 1 + 8 + 2 + 8 + 4);
-    bytes.extend_from_slice(b"BTHD");
-    bytes.push(0); // version
-    bytes.push(record_type);
-    bytes.extend_from_slice(&node_size.to_le_bytes());
-    bytes.extend_from_slice(&record_size.to_le_bytes());
-    bytes.extend_from_slice(&0u16.to_le_bytes()); // depth 0 (single leaf)
-    bytes.push(BTREE_V2_SPLIT_PERCENT);
-    bytes.push(BTREE_V2_MERGE_PERCENT);
-    bytes.extend_from_slice(&root_node_address.to_le_bytes());
-    let num_records_u16 = u16::try_from(num_records)
-        .map_err(|_| Error::UnsupportedFeature("v2 B-tree root record count exceeds u16".into()))?;
-    bytes.extend_from_slice(&num_records_u16.to_le_bytes());
-    bytes.extend_from_slice(&num_records.to_le_bytes()); // total records (length size 8)
-    let checksum = jenkins_lookup3(&bytes);
-    bytes.extend_from_slice(&checksum.to_le_bytes());
-    Ok(bytes)
-}
-
-/// Encode the single leaf node holding every chunk record. The node is written
-/// at its full `node_size`; the checksum sits immediately after the records
-/// and the remainder is zero padding.
-fn encode_btree_v2_leaf(
-    record_type: u8,
-    record_size: u16,
-    node_size: u32,
-    entries: &[FixedArrayChunkEntry],
-    chunk_size_len: u8,
-) -> Result<Vec<u8>> {
-    let filtered = record_type == BTREE_V2_RECORD_TYPE_FILTERED;
-    let ndims = entries
-        .first()
-        .map_or(0, |entry| entry.scaled_offsets.len());
-    let mut records = Vec::new();
-    records.extend_from_slice(b"BTLF");
-    records.push(0); // version
-    records.push(record_type);
-    let size_limit = if chunk_size_len >= 8 {
-        u64::MAX
-    } else {
-        (1u64 << (8 * u32::from(chunk_size_len))) - 1
-    };
-    for entry in entries {
-        if entry.scaled_offsets.len() != ndims {
-            return Err(Error::InvalidDefinition(
-                "v2 B-tree chunk records have inconsistent rank".into(),
-            ));
-        }
-        records.extend_from_slice(&entry.address.to_le_bytes());
-        if filtered {
-            if entry.size > size_limit {
-                return Err(Error::InvalidDefinition(format!(
-                    "filtered chunk byte length {} exceeds the {chunk_size_len}-byte record field",
-                    entry.size
-                )));
-            }
-            write_uvar(entry.size, usize::from(chunk_size_len), &mut records);
-            records.extend_from_slice(&entry.filter_mask.to_le_bytes());
-        }
-        for &scaled in &entry.scaled_offsets {
-            records.extend_from_slice(&scaled.to_le_bytes());
-        }
-    }
-    let _ = record_size;
-    let checksum = jenkins_lookup3(&records);
-    records.extend_from_slice(&checksum.to_le_bytes());
-    let node_size = checked_usize(u64::from(node_size), "v2 B-tree node size")?;
-    if records.len() > node_size {
-        return Err(Error::InvalidDefinition(
-            "v2 B-tree leaf records exceed node size".into(),
-        ));
-    }
-    records.resize(node_size, 0);
-    Ok(records)
-}
-
-fn encode_fixed_array_chunk_index_header(
-    num_entries: u64,
-    chunk_size_len: u8,
-    data_block_address: u64,
-) -> Result<Vec<u8>> {
-    let entry_size = u8::try_from(usize::from(OFFSET_SIZE) + usize::from(chunk_size_len) + 4)
-        .map_err(|_| Error::UnsupportedFeature("fixed array entry size exceeds u8".into()))?;
-    let mut bytes = Vec::with_capacity(4 + 1 + 1 + 1 + 1 + 8 + 8 + 4);
-    bytes.extend_from_slice(b"FAHD");
-    bytes.push(0);
-    bytes.push(1);
-    bytes.push(entry_size);
-    bytes.push(fixed_array_page_bits(num_entries)?);
-    bytes.extend_from_slice(&num_entries.to_le_bytes());
-    bytes.extend_from_slice(&data_block_address.to_le_bytes());
-    let checksum = jenkins_lookup3(&bytes);
-    bytes.extend_from_slice(&checksum.to_le_bytes());
-    Ok(bytes)
-}
-
-fn encode_fixed_array_chunk_index_data_block(
-    header_address: u64,
-    entries: &[FixedArrayChunkEntry],
-    chunk_size_len: u8,
-) -> Result<Vec<u8>> {
-    let entry_size = usize::from(OFFSET_SIZE) + usize::from(chunk_size_len) + 4;
-    let entries_len = checked_mul_usize(entries.len(), entry_size, "fixed array entries size")?;
-    let capacity = checked_add_usize(
-        4 + 1 + 1 + usize::from(OFFSET_SIZE),
-        checked_add_usize(entries_len, 4, "fixed array data block size")?,
-        "fixed array data block size",
-    )?;
-    let size_limit = if chunk_size_len >= 8 {
-        u64::MAX
-    } else {
-        (1u64 << (8 * u32::from(chunk_size_len))) - 1
-    };
-    let mut bytes = Vec::with_capacity(capacity);
-    bytes.extend_from_slice(b"FADB");
-    bytes.push(0);
-    bytes.push(1);
-    bytes.extend_from_slice(&header_address.to_le_bytes());
-    for entry in entries {
-        if entry.size > size_limit {
-            return Err(Error::InvalidDefinition(format!(
-                "filtered chunk byte length {} exceeds the {chunk_size_len}-byte entry field",
-                entry.size
-            )));
-        }
-        bytes.extend_from_slice(&entry.address.to_le_bytes());
-        write_uvar(entry.size, usize::from(chunk_size_len), &mut bytes);
-        bytes.extend_from_slice(&entry.filter_mask.to_le_bytes());
-    }
-    let checksum = jenkins_lookup3(&bytes);
-    bytes.extend_from_slice(&checksum.to_le_bytes());
     Ok(bytes)
 }
 
@@ -3733,7 +3426,7 @@ fn chunked_storage_data(
             ));
         }
         u32::try_from(chunk_dim).map_err(|_| {
-            Error::InvalidDefinition("chunk dimension exceeds HDF5 v4 layout capacity".into())
+            Error::InvalidDefinition("chunk dimension exceeds HDF5 layout message capacity".into())
         })?;
         chunks_per_dim.push(dim.div_ceil(chunk_dim));
     }
@@ -3806,7 +3499,6 @@ fn filtered_chunk_storage_data(
     chunk_shape: &[u64],
     element_size: usize,
     filters: &[FilterDescription],
-    kind: ChunkIndexKind,
 ) -> Result<(Vec<u8>, Option<PreparedChunkIndex>)> {
     if shape.is_empty() {
         return Err(Error::InvalidDefinition(
@@ -3827,7 +3519,7 @@ fn filtered_chunk_storage_data(
             ));
         }
         u32::try_from(chunk_dim).map_err(|_| {
-            Error::InvalidDefinition("chunk dimension exceeds HDF5 v4 layout capacity".into())
+            Error::InvalidDefinition("chunk dimension exceeds HDF5 layout message capacity".into())
         })?;
         chunks_per_dim.push(dim.div_ceil(chunk_dim));
     }
@@ -3891,8 +3583,10 @@ fn filtered_chunk_storage_data(
         let relative_address = u64::try_from(storage.len()).map_err(|_| {
             Error::InvalidDefinition("filtered chunk storage exceeds u64 capacity".into())
         })?;
-        let size = u64::try_from(encoded.len()).map_err(|_| {
-            Error::InvalidDefinition("filtered chunk byte length exceeds u64 capacity".into())
+        let size = u32::try_from(encoded.len()).map_err(|_| {
+            Error::UnsupportedFeature(
+                "filtered chunk byte length exceeds the 4-byte chunk index size field".into(),
+            )
         })?;
         storage.extend_from_slice(&encoded);
         entries.push(PreparedChunkIndexEntry {
@@ -3908,18 +3602,15 @@ fn filtered_chunk_storage_data(
     Ok((
         storage,
         Some(PreparedChunkIndex {
-            kind,
+            chunk_shape: chunk_shape.to_vec(),
             chunks: entries,
-            chunk_size_len: fixed_array_chunk_size_len(chunk_bytes_u64),
         }),
     ))
 }
 
-/// Build a B-tree v2 chunk index over an unfiltered, contiguously-laid-out
-/// chunked dataset (the same byte layout the implicit index would use). Needed
-/// because datasets with unlimited maximum dimensions may not use the implicit
-/// index.
-fn unfiltered_btree_chunk_index(
+/// Build the chunk index over an unfiltered chunked dataset, whose
+/// full-size chunks are laid out back to back in row-major grid order.
+fn unfiltered_chunk_index(
     shape: &[u64],
     chunk_shape: &[u64],
     element_size: usize,
@@ -3943,6 +3634,11 @@ fn unfiltered_btree_chunk_index(
         Error::InvalidDefinition("datatype element size exceeds u64 capacity".into())
     })?;
     let chunk_bytes = checked_mul_u64(chunk_elements, element_size_u64, "chunk byte length")?;
+    let size = u32::try_from(chunk_bytes).map_err(|_| {
+        Error::UnsupportedFeature(
+            "chunk byte length exceeds the 4-byte chunk index size field".into(),
+        )
+    })?;
     let total_chunks = chunks_per_dim.iter().try_fold(1u64, |acc, &count| {
         checked_mul_u64(acc, count, "chunk count")
     })?;
@@ -3953,7 +3649,7 @@ fn unfiltered_btree_chunk_index(
     for _ in 0..total_chunks {
         entries.push(PreparedChunkIndexEntry {
             relative_address,
-            size: chunk_bytes,
+            size,
             filter_mask: 0,
             scaled_offsets: chunk_indices.clone(),
         });
@@ -3961,25 +3657,9 @@ fn unfiltered_btree_chunk_index(
         increment_row_major_index(&mut chunk_indices, &chunks_per_dim);
     }
     Ok(Some(PreparedChunkIndex {
-        kind: ChunkIndexKind::BtreeV2,
+        chunk_shape: chunk_shape.to_vec(),
         chunks: entries,
-        // Unfiltered records store no chunk-size field.
-        chunk_size_len: 0,
     }))
-}
-
-/// Whether a max-shape declares any unlimited dimension.
-fn has_unlimited_max_shape(max_shape: Option<&[u64]>) -> bool {
-    max_shape.is_some_and(|dims| dims.contains(&UNLIMITED))
-}
-
-/// Width of the encoded chunk-size field in filtered fixed-array entries.
-/// Mirrors libhdf5, which sizes the field from the nominal chunk byte size
-/// with one byte of headroom (filters can expand a chunk); readers derive the
-/// same width from the dataset properties rather than the stored entry size.
-fn fixed_array_chunk_size_len(chunk_bytes: u64) -> u8 {
-    let log2 = 63u32.saturating_sub(chunk_bytes.leading_zeros());
-    (1 + (log2 + 8) / 8).min(8) as u8
 }
 
 #[allow(clippy::too_many_arguments)]

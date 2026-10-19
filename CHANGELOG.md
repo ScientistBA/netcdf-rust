@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- write every chunked HDF5/NetCDF-4 variable with a version-3 layout and a v1
+  B-tree chunk index, as netcdf-c does, instead of the v4 layout's implicit,
+  single-chunk, fixed-array, and v2 B-tree indexes, which netcdf-java (and so
+  Panoply) fails to read (#88)
 - read version 1/2 compound datatypes whose member names start off the 8-byte grid:
   a name is padded to a multiple of eight bytes from its own start, not from the
   start of the buffer, so a member after a float (20-byte description) no longer

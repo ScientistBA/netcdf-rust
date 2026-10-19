@@ -12,6 +12,15 @@ fn contains_signature(bytes: &[u8], signature: &[u8; 4]) -> bool {
     bytes.windows(4).any(|window| window == signature)
 }
 
+/// Whether chunks are indexed as netcdf-c writes them: v1 B-tree (`TREE`)
+/// nodes, and none of the v4 layout's index structures.
+fn uses_v1_btree_chunk_index(bytes: &[u8]) -> bool {
+    contains_signature(bytes, b"TREE")
+        && ![b"BTHD", b"FAHD", b"EAHD"]
+            .iter()
+            .any(|signature| contains_signature(bytes, signature))
+}
+
 #[test]
 fn writes_contiguous_f32_dataset_readable_by_hdf5_reader() {
     let values = [1.25_f32, 2.5, 3.75, 4.5, 5.25, 6.5];
@@ -577,7 +586,7 @@ fn writes_filtered_chunked_vlen_sequence_dataset_backed_by_global_heap() {
 }
 
 #[test]
-fn writes_implicit_chunked_dataset() {
+fn writes_unfiltered_chunked_dataset() {
     let values = (0_i32..15).collect::<Vec<_>>();
     let plan = Hdf5Builder::new()
         .dataset(
@@ -592,6 +601,7 @@ fn writes_implicit_chunked_dataset() {
         .finish(plan)
         .unwrap();
     let bytes = cursor.into_inner();
+    assert!(uses_v1_btree_chunk_index(&bytes));
 
     let file = Hdf5File::from_bytes(&bytes).unwrap();
     let dataset = file.dataset("/chunked").unwrap();
@@ -619,12 +629,7 @@ fn writes_resizable_chunked_dataspace() {
         .unwrap();
     let bytes = cursor.into_inner();
 
-    // Unlimited maximum dimensions require a version-2 B-tree chunk index
-    // (the implicit index is only valid for fixed max dims).
-    assert!(
-        contains_signature(&bytes, b"BTHD") && contains_signature(&bytes, b"BTLF"),
-        "resizable dataset should use a v2 B-tree chunk index"
-    );
+    assert!(uses_v1_btree_chunk_index(&bytes));
 
     let file = Hdf5File::from_bytes(&bytes).unwrap();
     let dataset = file.dataset("/stream").unwrap();
@@ -636,7 +641,7 @@ fn writes_resizable_chunked_dataspace() {
 }
 
 #[test]
-fn writes_resizable_filtered_chunked_dataspace_with_btree_index() {
+fn writes_resizable_filtered_chunked_dataspace() {
     let values = (0_i32..24).collect::<Vec<_>>();
     let plan = Hdf5Builder::new()
         .dataset(
@@ -658,12 +663,7 @@ fn writes_resizable_filtered_chunked_dataspace_with_btree_index() {
         .unwrap();
     let bytes = cursor.into_inner();
 
-    // Filtered unlimited datasets use a filtered (type-11) v2 B-tree index.
-    assert!(
-        contains_signature(&bytes, b"BTHD") && contains_signature(&bytes, b"BTLF"),
-        "filtered resizable dataset should use a v2 B-tree chunk index"
-    );
-    assert!(!contains_signature(&bytes, b"FAHD"));
+    assert!(uses_v1_btree_chunk_index(&bytes));
 
     let file = Hdf5File::from_bytes(&bytes).unwrap();
     let dataset = file.dataset("/stream").unwrap();
@@ -796,6 +796,7 @@ fn writes_single_chunk_deflate_dataset() {
         .finish(plan)
         .unwrap();
     let bytes = cursor.into_inner();
+    assert!(uses_v1_btree_chunk_index(&bytes));
 
     let file = Hdf5File::from_bytes(&bytes).unwrap();
     let dataset = file.dataset("/compressed").unwrap();
@@ -806,7 +807,7 @@ fn writes_single_chunk_deflate_dataset() {
 }
 
 #[test]
-fn writes_multi_chunk_deflate_dataset_with_fixed_array_index() {
+fn writes_multi_chunk_deflate_dataset() {
     let values = (0_i32..30).collect::<Vec<_>>();
     let plan = Hdf5Builder::new()
         .dataset(
@@ -826,6 +827,7 @@ fn writes_multi_chunk_deflate_dataset_with_fixed_array_index() {
         .finish(plan)
         .unwrap();
     let bytes = cursor.into_inner();
+    assert!(uses_v1_btree_chunk_index(&bytes));
 
     let file = Hdf5File::from_bytes(&bytes).unwrap();
     let dataset = file.dataset("/compressed").unwrap();
@@ -854,6 +856,47 @@ fn writes_multi_chunk_deflate_dataset_with_fixed_array_index() {
         slice.as_slice_memory_order().unwrap(),
         &[8, 9, 10, 11, 14, 15, 16, 17, 20, 21, 22, 23, 26, 27, 28, 29]
     );
+}
+
+/// More chunks than one v1 B-tree node holds (64) need internal nodes; 5000
+/// chunks build a three-level tree.
+#[test]
+fn writes_multi_level_chunk_btree() {
+    let values = (0_i32..5000).collect::<Vec<_>>();
+    for filtered in [false, true] {
+        let mut dataset = DatasetBuilder::typed_data("many", vec![5000], &values)
+            .unwrap()
+            .chunked(vec![1]);
+        if filtered {
+            dataset = dataset.filter(FilterDescription {
+                id: FILTER_DEFLATE,
+                name: None,
+                client_data: vec![1],
+            });
+        }
+        let plan = Hdf5Builder::new().dataset(dataset).into_plan().unwrap();
+
+        let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+            .finish(plan)
+            .unwrap();
+        let bytes = cursor.into_inner();
+        assert!(uses_v1_btree_chunk_index(&bytes));
+
+        let file = Hdf5File::from_bytes(&bytes).unwrap();
+        let dataset = file.dataset("/many").unwrap();
+        let array = dataset.read_array::<i32>().unwrap();
+        assert_eq!(array.as_slice_memory_order().unwrap(), values.as_slice());
+
+        let selection = SliceInfo {
+            selections: vec![SliceInfoElem::Slice {
+                start: 4090,
+                end: 4100,
+                step: 1,
+            }],
+        };
+        let slice = dataset.read_slice::<i32>(&selection).unwrap();
+        assert_eq!(slice.as_slice_memory_order().unwrap(), &values[4090..4100]);
+    }
 }
 
 #[test]
