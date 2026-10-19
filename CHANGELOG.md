@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.9.2 - 2026-10-18
+
 ### Fixed
 
 - write every chunked HDF5/NetCDF-4 variable with a version-3 layout and a v1
