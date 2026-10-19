@@ -1239,3 +1239,63 @@ fn nc4_vlen_string_attributes_with_a_fixed_string_base_are_read() {
         netcdf_reader::NcAttrValue::Chars("written by rust-hdf5".into())
     );
 }
+
+/// Plain HDF5 files (h5py, no NetCDF-4 markers) open through `NcFile::open` like netCDF-C
+/// opens them: datasets without `DIMENSION_LIST` get dimensions named by size, axes of the same
+/// size stay distinct, and nested groups are listed.
+#[cfg(feature = "netcdf4")]
+#[test]
+fn plain_hdf5_fixtures_open_as_netcdf() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("testdata")
+        .join("hdf5");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        eprintln!("SKIPPED: testdata/hdf5 not found");
+        return;
+    };
+    let mut opened = 0;
+    let mut failed = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("h5") {
+            continue;
+        }
+        match netcdf_reader::NcFile::open(&path) {
+            Ok(file) => {
+                let root = file.root_group().expect("root group");
+                fn count(g: &netcdf_reader::NcGroup) -> usize {
+                    g.variables.len() + g.groups.iter().map(count).sum::<usize>()
+                }
+                fn distinct_axes(g: &netcdf_reader::NcGroup) {
+                    for v in &g.variables {
+                        let names: std::collections::HashSet<_> =
+                            v.dimensions().iter().map(|d| &d.name).collect();
+                        assert_eq!(
+                            names.len(),
+                            v.dimensions().len(),
+                            "{}: {:?}",
+                            v.name(),
+                            v.dimensions()
+                        );
+                    }
+                    g.groups.iter().for_each(distinct_axes);
+                }
+                distinct_axes(root);
+                if count(root) > 0 {
+                    opened += 1;
+                }
+            }
+            Err(e) => failed.push(format!("{}: {e}", path.display())),
+        }
+    }
+    assert!(
+        opened >= 10,
+        "only {opened} plain HDF5 fixtures listed datasets; failures: {failed:#?}"
+    );
+    eprintln!(
+        "plain HDF5 fixtures: {opened} opened, {} failed: {failed:#?}",
+        failed.len()
+    );
+}

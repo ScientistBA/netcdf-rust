@@ -106,6 +106,26 @@ macro_rules! dispatch_read_as_f64 {
     }};
 }
 
+/// True when an HDF5 file carries none of NetCDF-4's markers: no `_NCProperties` root
+/// attribute and no dimension-scale dataset in the root group.
+fn is_plain_hdf5(hdf5: &Hdf5File) -> bool {
+    let Ok(root) = hdf5.root_group() else {
+        return false;
+    };
+    if root.attribute("_NCProperties").is_ok() {
+        return false;
+    }
+    let Ok(datasets) = root.datasets() else {
+        return false;
+    };
+    !datasets.iter().any(|ds| {
+        ds.attribute("CLASS")
+            .ok()
+            .and_then(|a| a.read_string().ok())
+            .is_some_and(|c| c == "DIMENSION_SCALE")
+    })
+}
+
 /// An opened NetCDF-4 file (backed by HDF5).
 pub struct Nc4File {
     hdf5: Hdf5File,
@@ -116,6 +136,16 @@ pub struct Nc4File {
 
 impl Nc4File {
     pub(crate) fn from_hdf5(hdf5: Hdf5File, metadata_mode: crate::NcMetadataMode) -> Result<Self> {
+        // A plain HDF5 file (not written through NetCDF-4) has no `_NCProperties` attribute and
+        // no dimension scales. netCDF-C reads such files with phony dimensions; strict NetCDF-4
+        // validation would reject every dataset for lacking `DIMENSION_LIST`, so they are read
+        // in lossy mode (dimensions named by size). NetCDF-4 files keep the requested mode.
+        let metadata_mode =
+            if metadata_mode == crate::NcMetadataMode::Strict && is_plain_hdf5(&hdf5) {
+                crate::NcMetadataMode::Lossy
+            } else {
+                metadata_mode
+            };
         Ok(Nc4File {
             hdf5,
             metadata_mode,
