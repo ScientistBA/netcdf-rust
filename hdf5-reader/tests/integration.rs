@@ -651,6 +651,37 @@ fn extensible_array_chunked() {
 }
 
 #[test]
+fn filtered_chunk_size_fields_of_three_and_five_bytes() {
+    // libhdf5 writes the chunk-size field of fixed array, extensible array and v2
+    // B-tree entries 1 + (log2(chunk bytes) + 8) / 8 bytes wide: 3 bytes for the
+    // 2 KiB gzip chunks, 5 bytes for the 16 MiB ones.
+    let path = skip_if_missing!("filtered_chunk_size_widths.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+    for name in ["/fixed", "/extensible", "/btree_v2"] {
+        let ds = file.dataset(name).unwrap();
+        assert_eq!(ds.shape(), &[32, 48], "{name}");
+        let data: ndarray::ArrayD<f64> = ds.read_array().unwrap_or_else(|e| panic!("{name}: {e}"));
+        for (i, v) in data.iter().enumerate() {
+            assert_eq!(*v, i as f64, "{name} element {i}");
+        }
+
+        let large = format!("{name}_16mib");
+        let ds = file.dataset(&large).unwrap();
+        assert_eq!(ds.shape(), &[4096, 2048], "{large}");
+        let data: ndarray::ArrayD<f64> = ds.read_array().unwrap_or_else(|e| panic!("{large}: {e}"));
+        for (i, v) in data.iter().enumerate() {
+            let (r, c) = (i / 2048, i % 2048);
+            let expected = if r % 1021 == 0 && c % 509 == 0 {
+                i as f64
+            } else {
+                0.0
+            };
+            assert_eq!(*v, expected, "{large} element ({r}, {c})");
+        }
+    }
+}
+
+#[test]
 fn btree_v2_chunked() {
     let path = skip_if_missing!("btree_v2_chunked.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
@@ -893,4 +924,40 @@ fn sohm_shared_attributes_resolve_on_group_and_dataset() {
         .attribute("shared_meta")
         .expect("dataset shared_meta attribute");
     assert_eq!(ds_meta.read_1d::<i32>().unwrap(), vec![0, 1, 2, 3]);
+}
+
+#[test]
+fn dense_huge_attribute_uses_short_btree_key() {
+    // Attribute heaps use 8-byte heap IDs, so a huge attribute is addressed through a
+    // 7-byte v2 B-tree key rather than a full-width length field.
+    let path = skip_if_missing!("dense_huge_attribute.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+    let ds = file.root_group().unwrap().dataset("data").unwrap();
+    assert_eq!(ds.attributes().len(), 13);
+    let huge: Vec<f32> = ds.attribute("huge").unwrap().read_1d().unwrap();
+    assert_eq!(huge.len(), 50_000);
+    assert_eq!(huge[0], 0.0);
+    assert_eq!(huge[49_999], 49_999.0);
+}
+
+#[test]
+fn vlen_string_attributes_with_a_fixed_string_base_are_read() {
+    // rust-hdf5 records a variable-length string's base type as a one-byte fixed
+    // string; libhdf5 uses a one-byte integer. Both are strings to netcdf-c.
+    let Some(path) = fixture_path("../netcdf4/rust_hdf5_string_attributes.nc") else {
+        eprintln!("SKIPPED: fixture netcdf4/rust_hdf5_string_attributes.nc not found");
+        return;
+    };
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+    let root = file.root_group().unwrap();
+    assert_eq!(
+        root.attribute("history").unwrap().read_string().unwrap(),
+        "edited by rust-hdf5"
+    );
+    let temp = root.dataset("temp").unwrap();
+    assert_eq!(
+        temp.attribute("comment").unwrap().read_string().unwrap(),
+        "written by rust-hdf5"
+    );
+    assert_eq!(temp.attribute("units").unwrap().read_string().unwrap(), "K");
 }
