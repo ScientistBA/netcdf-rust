@@ -8,6 +8,13 @@
   B-tree chunk index, as netcdf-c does, instead of the v4 layout's implicit,
   single-chunk, fixed-array, and v2 B-tree indexes, which netcdf-java (and so
   Panoply) fails to read (#88)
+- read version 1/2 compound datatypes whose member names start off the 8-byte grid:
+  a name is padded to a multiple of eight bytes from its own start, not from the
+  start of the buffer, so a member after a float (20-byte description) no longer
+  derails the parse (`unsupported datatype class`, `unexpected end of data`).
+  HEC-RAS geometry and plan files hit this in every attribute table
+- read the old fill value message (type 0x0004) as a size followed by the value;
+  the size was taken as part of the value, so unwritten chunks read back wrong
 - list a group's children in link creation order when the group tracks it, as
   libhdf5's creation-order index and netcdf-c do, instead of on-disk storage
   order; NetCDF-4 variables now come back in netcdf-c's order
