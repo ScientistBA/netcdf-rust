@@ -473,6 +473,34 @@ unsafe fn assume_init_u8_vec(mut buffer: Vec<MaybeUninit<u8>>) -> Vec<u8> {
     unsafe { Vec::from_raw_parts(ptr, len, capacity) }
 }
 
+/// `len` uninitialised slots, or an error when the allocation cannot be satisfied: a corrupt
+/// dataspace (one dimension of 2.8e14) asked for petabytes and aborted the process instead of
+/// failing the read (ModernViewer MV-110 fuzzing).
+fn try_uninit_vec<T>(len: usize) -> Result<Vec<MaybeUninit<T>>> {
+    let mut buffer: Vec<MaybeUninit<T>> = Vec::new();
+    buffer.try_reserve_exact(len).map_err(|_| {
+        Error::InvalidData(format!(
+            "cannot allocate {len} elements of {} bytes for the selection; the dataspace may be corrupt",
+            std::mem::size_of::<T>()
+        ))
+    })?;
+    // SAFETY: the capacity is reserved and `MaybeUninit` needs no initialisation.
+    unsafe { buffer.set_len(len) };
+    Ok(buffer)
+}
+
+/// `len` zero bytes, failing like [`try_uninit_vec`] instead of aborting.
+fn try_zeroed_bytes(len: usize) -> Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    buffer.try_reserve_exact(len).map_err(|_| {
+        Error::InvalidData(format!(
+            "cannot allocate {len} bytes for the selection; the dataspace may be corrupt"
+        ))
+    })?;
+    buffer.resize(len, 0);
+    Ok(buffer)
+}
+
 /// Convert an allocation of maybe-uninitialized values without copying it.
 ///
 /// # Safety
@@ -1258,7 +1286,7 @@ impl Dataset {
     pub fn read_raw_bytes(&self) -> Result<Vec<u8>> {
         let result: Result<Vec<u8>> = (|| {
             let total_bytes = self.raw_byte_len()?;
-            let mut output = vec![0u8; total_bytes];
+            let mut output = try_zeroed_bytes(total_bytes)?;
             self.read_raw_bytes_into_inner(&mut output)?;
             Ok(output)
         })();
@@ -1297,7 +1325,7 @@ impl Dataset {
     pub fn read_native_bytes(&self) -> Result<Vec<u8>> {
         let result: Result<Vec<u8>> = (|| {
             let total_bytes = self.raw_byte_len()?;
-            let mut output = vec![0u8; total_bytes];
+            let mut output = try_zeroed_bytes(total_bytes)?;
             self.read_raw_bytes_into_inner(&mut output)?;
             self.convert_to_native_endian(&mut output)?;
             Ok(output)
@@ -1636,9 +1664,7 @@ impl Dataset {
         if full_chunk_coverage {
             if T::native_copy_compatible(&self.datatype) && std::mem::size_of::<T>() == elem_size {
                 let mut result_values: Vec<MaybeUninit<T>> =
-                    std::iter::repeat_with(MaybeUninit::<T>::uninit)
-                        .take(total_elements)
-                        .collect();
+                    try_uninit_vec::<T>(total_elements)?;
                 let result_ptr = result_values.as_mut_ptr() as *mut u8;
                 let result_len = checked_mul_usize(
                     result_values.len(),
@@ -1672,7 +1698,7 @@ impl Dataset {
                 }
 
                 if total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES {
-                    let mut cached_bytes = vec![0u8; total_bytes];
+                    let mut cached_bytes = try_zeroed_bytes(total_bytes)?;
                     // SAFETY: full chunk coverage initialized all
                     // `total_bytes` at `result_ptr`, and both allocations are
                     // live and distinct.
@@ -1697,7 +1723,7 @@ impl Dataset {
                     .map_err(|e| Error::InvalidData(format!("array shape error: {e}")));
             }
 
-            let mut flat_data = vec![MaybeUninit::<u8>::uninit(); total_bytes];
+            let mut flat_data = try_uninit_vec::<u8>(total_bytes)?;
             let flat_ptr = flat_data.as_mut_ptr() as *mut u8;
             let flat_len = flat_data.len();
 
@@ -1735,7 +1761,7 @@ impl Dataset {
             return self.decode_raw_data::<T>(&flat_data);
         }
 
-        let mut flat_data = self.make_output_buffer(total_bytes);
+        let mut flat_data = self.make_output_buffer(total_bytes)?;
         for entry in &entries {
             let chunk_data =
                 self.load_exact_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
@@ -1898,9 +1924,7 @@ impl Dataset {
         if full_chunk_coverage {
             if T::native_copy_compatible(&self.datatype) && std::mem::size_of::<T>() == elem_size {
                 let mut result_values: Vec<MaybeUninit<T>> =
-                    std::iter::repeat_with(MaybeUninit::<T>::uninit)
-                        .take(total_elements)
-                        .collect();
+                    try_uninit_vec::<T>(total_elements)?;
                 let flat = FlatBufferPtr {
                     ptr: result_values.as_mut_ptr() as *mut u8,
                     len: checked_mul_usize(
@@ -1940,7 +1964,7 @@ impl Dataset {
                     result_shape.push(checked_usize(dim, "dataset dimension")?);
                 }
                 if total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES {
-                    let mut cached_bytes = vec![0u8; total_bytes];
+                    let mut cached_bytes = try_zeroed_bytes(total_bytes)?;
                     // SAFETY: full chunk coverage initialized all
                     // `total_bytes` at `flat.ptr`, and both allocations are
                     // live and distinct.
@@ -1960,7 +1984,7 @@ impl Dataset {
                     .map_err(|e| Error::InvalidData(format!("array shape error: {e}")));
             }
 
-            let mut flat_data = vec![MaybeUninit::<u8>::uninit(); total_bytes];
+            let mut flat_data = try_uninit_vec::<u8>(total_bytes)?;
             let flat = FlatBufferPtr {
                 ptr: flat_data.as_mut_ptr() as *mut u8,
                 len: flat_data.len(),
@@ -2000,7 +2024,7 @@ impl Dataset {
             return self.decode_raw_data::<T>(&flat_data);
         }
 
-        let mut flat_data = self.make_output_buffer(total_bytes);
+        let mut flat_data = self.make_output_buffer(total_bytes)?;
         let flat = FlatBufferPtr {
             ptr: flat_data.as_mut_ptr(),
             len: flat_data.len(),
@@ -2324,9 +2348,7 @@ impl Dataset {
         if fully_covered_unit_stride {
             if T::native_copy_compatible(&self.datatype) && std::mem::size_of::<T>() == elem_size {
                 let mut result_values: Vec<MaybeUninit<T>> =
-                    std::iter::repeat_with(MaybeUninit::<T>::uninit)
-                        .take(resolved.result_elements)
-                        .collect();
+                    try_uninit_vec::<T>(resolved.result_elements)?;
                 let result_ptr = result_values.as_mut_ptr() as *mut u8;
                 let result_len = checked_mul_usize(
                     result_values.len(),
@@ -2368,7 +2390,7 @@ impl Dataset {
                     .map_err(|e| Error::InvalidData(format!("array shape error: {e}")));
             }
 
-            let mut result_buf = vec![MaybeUninit::<u8>::uninit(); result_total_bytes];
+            let mut result_buf = try_uninit_vec::<u8>(result_total_bytes)?;
             let result_ptr = result_buf.as_mut_ptr() as *mut u8;
             let result_len = result_buf.len();
 
@@ -2409,7 +2431,7 @@ impl Dataset {
             );
         }
 
-        let mut result_buf = self.make_output_buffer(result_total_bytes);
+        let mut result_buf = self.make_output_buffer(result_total_bytes)?;
 
         // For each overlapping chunk: decompress and copy matching elements.
         for entry in &overlapping {
@@ -2573,9 +2595,7 @@ impl Dataset {
         let row_bytes = checked_mul_usize(col_count, elem_size, "single chunk slice row bytes")?;
 
         let mut result_values: Vec<MaybeUninit<T>> =
-            std::iter::repeat_with(MaybeUninit::<T>::uninit)
-                .take(resolved.result_elements)
-                .collect();
+            try_uninit_vec::<T>(resolved.result_elements)?;
         let result_ptr = result_values.as_mut_ptr() as *mut u8;
         let result_len = checked_mul_usize(
             result_values.len(),
@@ -2724,9 +2744,7 @@ impl Dataset {
         if fully_covered_unit_stride {
             if T::native_copy_compatible(&self.datatype) && std::mem::size_of::<T>() == elem_size {
                 let mut result_values: Vec<MaybeUninit<T>> =
-                    std::iter::repeat_with(MaybeUninit::<T>::uninit)
-                        .take(resolved.result_elements)
-                        .collect();
+                    try_uninit_vec::<T>(resolved.result_elements)?;
                 let flat = FlatBufferPtr {
                     ptr: result_values.as_mut_ptr() as *mut u8,
                     len: checked_mul_usize(
@@ -2775,7 +2793,7 @@ impl Dataset {
                     .map_err(|e| Error::InvalidData(format!("array shape error: {e}")));
             }
 
-            let mut result_buf = vec![MaybeUninit::<u8>::uninit(); result_total_bytes];
+            let mut result_buf = try_uninit_vec::<u8>(result_total_bytes)?;
             let flat = FlatBufferPtr {
                 ptr: result_buf.as_mut_ptr() as *mut u8,
                 len: result_buf.len(),
@@ -2819,7 +2837,7 @@ impl Dataset {
             );
         }
 
-        let mut result_buf = self.make_output_buffer(result_total_bytes);
+        let mut result_buf = self.make_output_buffer(result_total_bytes)?;
 
         let flat = FlatBufferPtr {
             ptr: result_buf.as_mut_ptr(),
@@ -3000,7 +3018,7 @@ impl Dataset {
             layout.elem_size,
             "contiguous slice block size in bytes",
         )?;
-        let mut result_buf = self.make_output_buffer(layout.result_total_bytes);
+        let mut result_buf = self.make_output_buffer(layout.result_total_bytes)?;
 
         let prefix_blocks =
             resolved.dims[..tail_start]
@@ -3184,14 +3202,14 @@ impl Dataset {
     ) -> Result<ArrayD<T>> {
         let elem_size = self.raw_element_size()?;
         let total_bytes = checked_mul_usize(element_count, elem_size, "fill result size in bytes")?;
-        let fill = self.make_output_buffer(total_bytes);
+        let fill = self.make_output_buffer(total_bytes)?;
         self.decode_buffer_with_shape::<T>(&fill, element_count, shape)
     }
 
-    fn make_output_buffer(&self, total_bytes: usize) -> Vec<u8> {
-        let mut buf = vec![0u8; total_bytes];
+    fn make_output_buffer(&self, total_bytes: usize) -> Result<Vec<u8>> {
+        let mut buf = try_zeroed_bytes(total_bytes)?;
         self.fill_output_buffer(&mut buf);
-        buf
+        Ok(buf)
     }
 
     fn fill_output_buffer(&self, buf: &mut [u8]) {
