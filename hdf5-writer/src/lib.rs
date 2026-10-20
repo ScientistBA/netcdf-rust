@@ -28,6 +28,9 @@
 use flate2::{write::ZlibEncoder, Compression};
 use std::io::{Seek, SeekFrom, Write};
 
+mod stream;
+pub use stream::Hdf5StreamWriter;
+
 pub use hdf5_core::{
     fletcher32, jenkins_lookup3, ByteOrder, ChunkIndexing, CompoundField, DataLayout,
     DataspaceMessage, DataspaceType, Datatype, EnumMember, FillTime, FillValueMessage,
@@ -246,6 +249,8 @@ pub struct DatasetBuilder {
     vlen_string_values: Option<Vec<String>>,
     vlen_sequence_values: Option<Vec<Vec<u8>>>,
     attributes: Vec<AttributeBuilder>,
+    /// Data arrive later through [`Hdf5StreamWriter`] instead of `raw_data`.
+    streamed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,6 +274,7 @@ impl DatasetBuilder {
             vlen_string_values: None,
             vlen_sequence_values: None,
             attributes: Vec::new(),
+            streamed: false,
         }
     }
 
@@ -358,6 +364,7 @@ impl DatasetBuilder {
             vlen_string_values: Some(strings),
             vlen_sequence_values: None,
             attributes: Vec::new(),
+            streamed: false,
         })
     }
 
@@ -406,6 +413,7 @@ impl DatasetBuilder {
             vlen_string_values: None,
             vlen_sequence_values: Some(values),
             attributes: Vec::new(),
+            streamed: false,
         })
     }
 
@@ -464,6 +472,20 @@ impl DatasetBuilder {
         self.vlen_string_values = None;
         self.vlen_sequence_values = None;
         Ok(self)
+    }
+
+    /// The data are written later, chunk by chunk or slice by slice, through an
+    /// [`Hdf5StreamWriter`]; any data set on the builder is dropped.
+    pub fn streamed(mut self) -> Self {
+        self.raw_data = None;
+        self.vlen_string_values = None;
+        self.vlen_sequence_values = None;
+        self.streamed = true;
+        self
+    }
+
+    pub fn is_streamed(&self) -> bool {
+        self.streamed
     }
 
     pub fn attribute(mut self, attribute: AttributeBuilder) -> Self {
@@ -1530,7 +1552,11 @@ fn prepare_datasets(
             }
         }
         let expected = expected_data_len(&dataset.shape, element_size)?;
-        let (storage_data, chunk_index) = if let Some(values) = &dataset.vlen_string_values {
+        let (storage_data, chunk_index) = if dataset.streamed {
+            // Written by `Hdf5StreamWriter`; the storage is filled in at `finish`.
+            stream::validate_streamed(dataset)?;
+            (Vec::new(), None)
+        } else if let Some(values) = &dataset.vlen_string_values {
             if dataset.fill_value.is_some() {
                 return Err(Error::InvalidDefinition(format!(
                     "dataset '{}' cannot combine variable-length strings with a fill value",

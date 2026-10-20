@@ -7,6 +7,9 @@
 
 use std::io::Write;
 
+mod stream;
+pub use stream::NcStreamWriter;
+
 #[cfg(feature = "netcdf4")]
 use hdf5_writer::{
     AttributeBuilder as H5AttributeBuilder, ByteOrder as H5ByteOrder,
@@ -227,6 +230,8 @@ struct VariableDef {
     vlen_values: Option<Vec<Vec<u8>>>,
     storage: VariableStorageDef,
     fill_value: Option<VariableFillValue>,
+    /// Data arrive later through [`NcStreamWriter`].
+    streamed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -449,6 +454,28 @@ impl NcFileBuilder {
         let chunk_shape = chunk_shape.into();
         validate_chunk_shape_for_variable(variable, &chunk_shape)?;
         variable.storage.chunk_shape = Some(chunk_shape);
+        Ok(())
+    }
+
+    /// The variable's data are written later through [`NcFileBuilder::stream`] /
+    /// [`NcStreamWriter::write_slice`] instead of being held in the builder. Numeric
+    /// (fixed-size primitive) variables only; any data already set is dropped.
+    pub fn set_variable_streamed(&mut self, variable: VariableId) -> Result<()> {
+        let def = self.variable_mut(variable)?;
+        if def.dtype.classic_type_code().is_none() && !stream::is_streamable(&def.dtype) {
+            return Err(Error::UnsupportedFeature(format!(
+                "variable '{}' of type {:?} cannot be streamed",
+                def.name, def.dtype
+            )));
+        }
+        if def.dtype == NcType::Char {
+            return Err(Error::UnsupportedFeature(format!(
+                "char variable '{}' cannot be streamed",
+                def.name
+            )));
+        }
+        def.data.clear();
+        def.streamed = true;
         Ok(())
     }
 
@@ -1295,6 +1322,11 @@ impl NcFileBuilder {
         }
         let dimension_sizes = self.nc4_dimension_sizes()?;
         for variable in &self.variables {
+            if variable.streamed {
+                validate_nc4_variable_storage(variable)?;
+                validate_nc4_variable_fill_value(variable)?;
+                continue;
+            }
             validate_nc4_variable_data(variable, &dimension_sizes)?;
         }
         for (dim_id, dimension) in self.dimensions.iter().enumerate() {
@@ -1318,8 +1350,19 @@ impl NcFileBuilder {
 
     #[cfg(feature = "netcdf4")]
     fn build_hdf5_plan(&self, format: NcFormat) -> Result<hdf5_writer::Hdf5WritePlan> {
+        self.build_hdf5_plan_with(format, &self.nc4_dimension_sizes()?, false)
+    }
+
+    /// `streaming`: streamed variables (and the hidden scales of unlimited dimensions) become
+    /// streamed datasets, filled through [`NcStreamWriter`].
+    #[cfg(feature = "netcdf4")]
+    fn build_hdf5_plan_with(
+        &self,
+        format: NcFormat,
+        dimension_sizes: &[u64],
+        streaming: bool,
+    ) -> Result<hdf5_writer::Hdf5WritePlan> {
         let mut builder = Hdf5Builder::new();
-        let dimension_sizes = self.nc4_dimension_sizes()?;
         if format == NcFormat::Nc4Classic {
             builder = builder.attribute(
                 H5AttributeBuilder::scalar("_nc3_strict", 1_i32)
@@ -1344,21 +1387,25 @@ impl NcFileBuilder {
                 continue;
             }
             let size = dimension_sizes[dim_id];
-            let zeros = vec![0_i32; checked_usize(size, "dimension scale size")?];
-            let mut dataset = H5DatasetBuilder::typed_data(&dimension.name, vec![size], &zeros)
-                .map_err(hdf5_error_to_unsupported)?
-                .attribute(H5AttributeBuilder::fixed_string("CLASS", "DIMENSION_SCALE"))
-                .attribute(H5AttributeBuilder::fixed_string(
-                    "NAME",
-                    format!(
-                        "This is a netCDF dimension but not a netCDF variable. {}",
-                        path_leaf_name(&dimension.name)
-                    ),
-                ))
-                .attribute(
-                    H5AttributeBuilder::scalar("_Netcdf4Dimid", dim_id as i32)
-                        .map_err(hdf5_error_to_unsupported)?,
-                );
+            let mut dataset = if streaming && dimension.is_unlimited {
+                H5DatasetBuilder::typed::<i32>(&dimension.name, vec![size]).streamed()
+            } else {
+                let zeros = vec![0_i32; checked_usize(size, "dimension scale size")?];
+                H5DatasetBuilder::typed_data(&dimension.name, vec![size], &zeros)
+                    .map_err(hdf5_error_to_unsupported)?
+            }
+            .attribute(H5AttributeBuilder::fixed_string("CLASS", "DIMENSION_SCALE"))
+            .attribute(H5AttributeBuilder::fixed_string(
+                "NAME",
+                format!(
+                    "This is a netCDF dimension but not a netCDF variable. {}",
+                    path_leaf_name(&dimension.name)
+                ),
+            ))
+            .attribute(
+                H5AttributeBuilder::scalar("_Netcdf4Dimid", dim_id as i32)
+                    .map_err(hdf5_error_to_unsupported)?,
+            );
             if let Some(reference_list) = self.reference_list_attribute(DimensionId(dim_id))? {
                 dataset = dataset.attribute(reference_list);
             }
@@ -1379,7 +1426,14 @@ impl NcFileBuilder {
                 .iter()
                 .map(|id| dimension_sizes[id.0])
                 .collect::<Vec<_>>();
-            let mut dataset = if variable.dtype == NcType::String {
+            let mut dataset = if streaming && variable.streamed {
+                H5DatasetBuilder::new(
+                    &variable.name,
+                    nc_type_to_hdf5(&variable.dtype)?,
+                    shape.clone(),
+                )
+                .streamed()
+            } else if variable.dtype == NcType::String {
                 let values = variable.string_values.as_ref().ok_or_else(|| {
                     Error::InvalidDefinition(format!(
                         "NC_STRING variable '{}' has no string data",
@@ -1619,6 +1673,7 @@ impl NcFileBuilder {
             vlen_values: None,
             storage: VariableStorageDef::default(),
             fill_value: None,
+            streamed: false,
         });
         Ok(id)
     }
@@ -1995,7 +2050,7 @@ impl NcFileBuilder {
                 )));
             }
             let expected = expected_variable_bytes(self, variable, is_record)?;
-            if variable.data.len() != expected {
+            if !variable.streamed && variable.data.len() != expected {
                 return Err(Error::DataLengthMismatch {
                     expected,
                     actual: variable.data.len(),
@@ -3712,7 +3767,7 @@ fn variable_is_record(builder: &NcFileBuilder, variable: &VariableDef) -> Result
 fn infer_num_records(builder: &NcFileBuilder) -> Result<u64> {
     let mut records: Option<u64> = None;
     for variable in &builder.variables {
-        if !variable_is_record(builder, variable)? {
+        if !variable_is_record(builder, variable)? || variable.streamed {
             continue;
         }
         let current = infer_num_records_for_var(builder, variable)?;
