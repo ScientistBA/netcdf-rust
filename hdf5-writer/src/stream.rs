@@ -374,6 +374,12 @@ impl<W: Write + Seek> Hdf5StreamWriter<W> {
                 base
             }
         };
+        if shape.is_empty() {
+            // A scalar: its one element.
+            self.sink.seek(SeekFrom::Start(base))?;
+            self.sink.write_all(data)?;
+            return Ok(());
+        }
         let strides = row_major_strides(shape, "dataset stride")?;
         let row = count[count.len() - 1] * element_size;
         let mut source = 0usize;

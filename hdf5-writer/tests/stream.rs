@@ -138,6 +138,7 @@ fn unlimited_time_grows_and_unwritten_chunks_read_as_fill() {
                 .fill_value((-1.0f32).to_le_bytes().to_vec())
                 .streamed(),
         )
+        .dataset(DatasetBuilder::typed::<f64>("scalar", vec![]).streamed())
         .dataset(
             DatasetBuilder::typed::<f32>("sparse", vec![4, 4])
                 .chunked(vec![2, 2])
@@ -156,6 +157,10 @@ fn unlimited_time_grows_and_unwritten_chunks_read_as_fill() {
             .write_slice(series, &[t, 0], &[1, 3], &le_f32(&row))
             .unwrap();
     }
+    let scalar = writer.dataset_index("scalar").unwrap();
+    writer
+        .write_slice(scalar, &[], &[], &2.5f64.to_le_bytes())
+        .unwrap();
     // Only the top-left chunk of `sparse`, through the whole-chunk API.
     let sparse = writer.dataset_index("sparse").unwrap();
     writer
@@ -177,6 +182,12 @@ fn unlimited_time_grows_and_unwritten_chunks_read_as_fill() {
         .flat_map(|t| [t as f32, t as f32 + 0.25, t as f32 + 0.5])
         .collect();
     assert_eq!(read.iter().copied().collect::<Vec<_>>(), expected);
+    let read = file
+        .dataset("/scalar")
+        .unwrap()
+        .read_array::<f64>()
+        .unwrap();
+    assert_eq!(read.iter().copied().collect::<Vec<_>>(), vec![2.5]);
     let read = file
         .dataset("/sparse")
         .unwrap()
