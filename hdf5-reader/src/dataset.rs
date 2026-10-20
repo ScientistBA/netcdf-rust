@@ -1663,8 +1663,7 @@ impl Dataset {
         };
         if full_chunk_coverage {
             if T::native_copy_compatible(&self.datatype) && std::mem::size_of::<T>() == elem_size {
-                let mut result_values: Vec<MaybeUninit<T>> =
-                    try_uninit_vec::<T>(total_elements)?;
+                let mut result_values: Vec<MaybeUninit<T>> = try_uninit_vec::<T>(total_elements)?;
                 let result_ptr = result_values.as_mut_ptr() as *mut u8;
                 let result_len = checked_mul_usize(
                     result_values.len(),
@@ -1923,8 +1922,7 @@ impl Dataset {
         };
         if full_chunk_coverage {
             if T::native_copy_compatible(&self.datatype) && std::mem::size_of::<T>() == elem_size {
-                let mut result_values: Vec<MaybeUninit<T>> =
-                    try_uninit_vec::<T>(total_elements)?;
+                let mut result_values: Vec<MaybeUninit<T>> = try_uninit_vec::<T>(total_elements)?;
                 let flat = FlatBufferPtr {
                     ptr: result_values.as_mut_ptr() as *mut u8,
                     len: checked_mul_usize(
@@ -2594,8 +2592,7 @@ impl Dataset {
         let chunk_cols = checked_usize(chunk_shape[1], "single chunk column extent")?;
         let row_bytes = checked_mul_usize(col_count, elem_size, "single chunk slice row bytes")?;
 
-        let mut result_values: Vec<MaybeUninit<T>> =
-            try_uninit_vec::<T>(resolved.result_elements)?;
+        let mut result_values: Vec<MaybeUninit<T>> = try_uninit_vec::<T>(resolved.result_elements)?;
         let result_ptr = result_values.as_mut_ptr() as *mut u8;
         let result_len = checked_mul_usize(
             result_values.len(),
@@ -4123,6 +4120,15 @@ fn slice_array<T: H5Type + Clone>(
 mod tests {
     use super::*;
     use crate::storage::BytesStorage;
+
+    /// Buffers sized from a corrupt dataspace fail the read instead of aborting.
+    #[test]
+    fn impossible_selection_buffers_are_errors() {
+        assert!(try_uninit_vec::<u64>(usize::MAX / 4).is_err());
+        assert!(try_zeroed_bytes(usize::MAX / 2).is_err());
+        assert_eq!(try_uninit_vec::<u64>(3).unwrap().len(), 3);
+        assert_eq!(try_zeroed_bytes(5).unwrap(), vec![0u8; 5]);
+    }
     use crate::superblock::Superblock;
     use std::collections::HashMap;
 

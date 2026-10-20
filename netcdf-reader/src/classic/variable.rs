@@ -534,7 +534,8 @@ fn check_selection_fits_file<T: NcReadType>(
     resolved: &ResolvedClassicSelection,
     file_len: u64,
 ) -> Result<()> {
-    let bytes = (resolved.result_elements as u64).checked_mul(std::mem::size_of::<T>() as u64);
+    // `T` matches the variable's type (checked by the callers), so this is its size on disk.
+    let bytes = (resolved.result_elements as u64).checked_mul(T::element_size() as u64);
     match bytes {
         Some(bytes) if bytes <= file_len => Ok(()),
         _ => Err(Error::InvalidData(format!(
