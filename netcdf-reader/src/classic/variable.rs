@@ -275,6 +275,7 @@ impl ClassicFile {
             selection,
             if var.is_record_var { self.numrecs } else { 0 },
         )?;
+        check_selection_fits_file::<T>(var, &resolved, self.storage.len())?;
 
         if !var.is_record_var {
             return read_non_record_variable_slice_direct(&self.storage, var, &resolved);
@@ -310,6 +311,7 @@ impl ClassicFile {
             selection,
             if var.is_record_var { self.numrecs } else { 0 },
         )?;
+        check_selection_fits_file::<T>(var, &resolved, self.storage.len())?;
 
         if !var.is_record_var {
             return read_non_record_variable_slice_parallel(&self.storage, var, &resolved);
@@ -522,6 +524,24 @@ fn resolve_classic_selection(
         result_shape,
         result_elements,
     })
+}
+
+/// Classic data are uncompressed: every selected element is its own byte range in the file, so
+/// a selection needing more bytes than the file holds comes from a corrupt header (a dimension
+/// of 4.4e12 asked for a 26 TB buffer and aborted the process; ModernViewer MV-110 fuzzing).
+fn check_selection_fits_file<T: NcReadType>(
+    var: &NcVariable,
+    resolved: &ResolvedClassicSelection,
+    file_len: u64,
+) -> Result<()> {
+    let bytes = (resolved.result_elements as u64).checked_mul(std::mem::size_of::<T>() as u64);
+    match bytes {
+        Some(bytes) if bytes <= file_len => Ok(()),
+        _ => Err(Error::InvalidData(format!(
+            "selection of variable '{}' ({} elements) exceeds the {file_len}-byte file; the header is corrupt",
+            var.name, resolved.result_elements
+        ))),
+    }
 }
 
 fn read_non_record_variable_slice_direct<T: NcReadType>(
