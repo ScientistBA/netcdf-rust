@@ -1299,3 +1299,41 @@ fn plain_hdf5_fixtures_open_as_netcdf() {
         failed.len()
     );
 }
+
+/// A CDF-5 header whose only dimension claims 4.4e12 elements: reading the variable must fail
+/// with an error, not abort the process trying to allocate 35 TB.
+#[test]
+fn classic_selection_larger_than_the_file_is_an_error() {
+    fn name(out: &mut Vec<u8>, text: &str) {
+        out.extend_from_slice(&(text.len() as u64).to_be_bytes());
+        out.extend_from_slice(text.as_bytes());
+        out.resize(out.len().next_multiple_of(4), 0);
+    }
+    let mut b = b"CDF\x05".to_vec();
+    b.extend_from_slice(&0u64.to_be_bytes()); // numrecs
+    b.extend_from_slice(&0x0Au32.to_be_bytes()); // NC_DIMENSION
+    b.extend_from_slice(&1u64.to_be_bytes());
+    name(&mut b, "x");
+    b.extend_from_slice(&4_400_000_000_000u64.to_be_bytes());
+    b.extend_from_slice(&[0; 12]); // no global attributes
+    b.extend_from_slice(&0x0Bu32.to_be_bytes()); // NC_VARIABLE
+    b.extend_from_slice(&1u64.to_be_bytes());
+    name(&mut b, "v");
+    b.extend_from_slice(&1u64.to_be_bytes()); // one dimension
+    b.extend_from_slice(&0u64.to_be_bytes()); // dimid 0
+    b.extend_from_slice(&[0; 12]); // no variable attributes
+    b.extend_from_slice(&6u32.to_be_bytes()); // NC_DOUBLE
+    b.extend_from_slice(&(4_400_000_000_000u64 * 8).to_be_bytes()); // vsize
+    let begin = b.len() as u64 + 8;
+    b.extend_from_slice(&begin.to_be_bytes());
+    b.extend_from_slice(&[0; 64]); // a little data
+
+    let file = match netcdf_reader::NcFile::from_bytes(&b) {
+        Ok(file) => file,
+        // Refusing the header outright is just as good.
+        Err(_) => return,
+    };
+    let all = netcdf_reader::NcSliceInfo::all(1);
+    assert!(file.read_variable_slice::<f64>("v", &all).is_err());
+    assert!(file.read_variable_slice_as_f64("v", &all).is_err());
+}
