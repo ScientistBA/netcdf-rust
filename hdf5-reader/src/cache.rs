@@ -43,6 +43,26 @@ struct InFlightLoad {
     ready: Condvar,
 }
 
+/// Ends an in-flight load however the loader leaves — with a value, an error or a panic:
+/// the key is no longer in flight and the waiters wake (they retry, and one of them loads).
+/// Without it, a loader that panicked (a corrupt chunk caught by `catch_unwind` upstream)
+/// left every later reader of that chunk waiting forever.
+struct FinishLoad<'a> {
+    cache: &'a ChunkCache,
+    key: ChunkKey,
+    in_flight: Arc<InFlightLoad>,
+}
+
+impl Drop for FinishLoad<'_> {
+    fn drop(&mut self) {
+        let mut state = self.cache.inner.lock();
+        state.in_flight.remove(&self.key);
+        let mut completed = self.in_flight.completed.lock();
+        *completed = true;
+        self.in_flight.ready.notify_all();
+    }
+}
+
 /// Point-in-time statistics for a [`ChunkCache`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ChunkCacheStats {
@@ -143,14 +163,13 @@ impl ChunkCache {
                     state.in_flight.insert(key.clone(), Arc::clone(&in_flight));
                     drop(state);
 
+                    let finish = FinishLoad {
+                        cache: self,
+                        key: key.clone(),
+                        in_flight,
+                    };
                     let result = load().map(|data| self.insert(key.clone(), data));
-
-                    let mut state = self.inner.lock();
-                    state.in_flight.remove(&key);
-                    let mut completed = in_flight.completed.lock();
-                    *completed = true;
-                    in_flight.ready.notify_all();
-
+                    drop(finish);
                     return result;
                 }
             };
@@ -317,6 +336,23 @@ mod tests {
         });
 
         assert_eq!(load_count.load(Ordering::SeqCst), 1);
+    }
+
+    /// A loader that panics must not leave the key in flight: the next caller loads it.
+    #[test]
+    fn a_panicking_load_does_not_block_later_readers() {
+        let cache = ChunkCache::new(1024, 10);
+        let key = ChunkKey {
+            dataset_addr: 7,
+            chunk_offsets: SmallVec::from_vec(vec![1]),
+        };
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = cache.get_or_insert_with(key.clone(), || panic!("corrupt chunk"));
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(cache.stats().in_flight, 0);
+        let value = cache.get_or_insert_with(key, || Ok(vec![9])).unwrap();
+        assert_eq!(&*value, &[9]);
     }
 
     #[test]
