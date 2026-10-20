@@ -223,6 +223,17 @@ fn apply_builtin_filter_with_limit(
     }
 }
 
+/// A zero-filled filter output buffer, or an error when it cannot be allocated: a corrupted
+/// chunk shape or size field must fail the read, not abort the process.
+pub(crate) fn zeroed_output(len: usize, context: &str) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(len).map_err(|_| {
+        Error::DecompressionError(format!("{context}: cannot allocate {len} output bytes"))
+    })?;
+    out.resize(len, 0);
+    Ok(out)
+}
+
 fn validate_output_limit(context: &str, len: usize, max_output_len: Option<usize>) -> Result<()> {
     if let Some(max_output_len) = max_output_len {
         if len > max_output_len {

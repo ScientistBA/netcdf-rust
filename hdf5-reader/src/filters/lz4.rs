@@ -53,7 +53,13 @@ fn decompress_inner(data: &[u8], max_output_len: Option<usize>) -> Result<Vec<u8
         }
     }
 
-    let mut output = Vec::with_capacity(orig_size);
+    // The output grows as blocks are decoded; reserve no more than LZ4 can expand to
+    // (~255:1), so a corrupted size field cannot abort the process.
+    let mut output = Vec::new();
+    let capacity = orig_size.min(data.len().saturating_mul(255).saturating_add(64));
+    output.try_reserve_exact(capacity).map_err(|_| {
+        Error::DecompressionError(format!("LZ4: cannot allocate {capacity} output bytes"))
+    })?;
     let mut pos = 8;
 
     while pos < data.len() && output.len() < orig_size {
