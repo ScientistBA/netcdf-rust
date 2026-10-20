@@ -29,7 +29,13 @@ fn decompress_inner(data: &[u8], max_output_len: Option<usize>) -> Result<Vec<u8
 
 fn decompress_bounded(data: &[u8], max_output_len: usize) -> Result<Vec<u8>> {
     let mut decoder = Decompress::new(true);
-    let mut output = Vec::with_capacity(max_output_len);
+    // DEFLATE expands at most ~1032:1, so no valid stream needs more room than this; a corrupted
+    // chunk shape can no longer ask for a multi-gigabyte buffer before a byte is decoded.
+    let capacity = max_output_len.min(data.len().saturating_mul(1032).saturating_add(64));
+    let mut output = Vec::new();
+    output.try_reserve_exact(capacity).map_err(|_| {
+        Error::DecompressionError(format!("DEFLATE: cannot allocate {capacity} output bytes"))
+    })?;
     let status = decoder
         .decompress_vec(data, &mut output, FlushDecompress::Finish)
         .map_err(|e| Error::DecompressionError(format!("DEFLATE decompression failed: {e}")))?;
@@ -46,6 +52,18 @@ fn decompress_bounded(data: &[u8], max_output_len: usize) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A corrupted chunk shape gives an absurd output limit: the stream still decodes,
+    /// without reserving the limit up front (it used to abort on allocation failure).
+    #[test]
+    fn absurd_output_limit_does_not_preallocate() {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        std::io::Write::write_all(&mut encoder, &[7u8; 300]).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let out = decompress_with_limit(&compressed, usize::MAX / 2).unwrap();
+        assert_eq!(out, vec![7u8; 300]);
+        assert!(out.capacity() <= compressed.len() * 1032 + 64);
+    }
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
     use std::io::Write;
