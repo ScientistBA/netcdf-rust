@@ -371,9 +371,18 @@ fn resolve_variable_dimensions_by_size(
             }
         }
         if !matched {
-            // Create an anonymous dimension
+            // An anonymous dimension named by its size (netCDF-C's phony dimensions); a second
+            // axis of the same size in this variable gets its own name, so a 3 x 3 dataset has
+            // two distinct axes.
+            let base = format!("dim_{}", dim_size);
+            let mut name = base.clone();
+            let mut k = 2;
+            while var_dims.iter().any(|d: &NcDimension| d.name == name) {
+                name = format!("{base}_{k}");
+                k += 1;
+            }
             var_dims.push(NcDimension {
-                name: format!("dim_{}", dim_size),
+                name,
                 size: dim_size,
                 is_unlimited: false,
             });
